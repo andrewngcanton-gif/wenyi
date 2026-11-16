@@ -2324,7 +2324,7 @@ wheels = [
 
 [[package]]
 name = "wenyi-core"
-source = { directory = "../../packages/core" }
+source = { editable = "../../packages/core" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "google-genai", version = "2.33.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2378,7 +2378,7 @@ dev = [
 requires-dist = [
     { name = "rich", specifier = ">=13.7" },
     { name = "typer", specifier = ">=0.12" },
-    { name = "wenyi-core", directory = "../../packages/core" },
+    { name = "wenyi-core", editable = "../../packages/core" },
 ]
 
 [package.metadata.requires-dev]

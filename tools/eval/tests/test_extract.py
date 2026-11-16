@@ -86,7 +86,7 @@ def test_extract_preserves_translated_empty_missing_and_stale_rows(tmp_path: Pat
     assert rows[4]["target"] is None
     assert result["review"]["status"] == "missing"
     assert result["events"]["failure_or_retry_counts"] == {"translation.retry": 1}
-    assert result["reflection"]["status"] == "unsupported"
+    assert result["reflection"]["status"] == "not_enabled"
     assert result["read_only_verified"] is True
     assert hash_tree(state) == before
 

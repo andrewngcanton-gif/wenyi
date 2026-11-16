@@ -15,7 +15,7 @@ from .common import (
     utc_now,
     write_json_atomic,
 )
-from .manifest import SUPPORTED_GROUPS
+from .reflection import extract_reflection
 from .run_variants import find_run_dir
 
 EXTRACTION_PROTOCOL = 1
@@ -86,24 +86,40 @@ def _review_summary(value: Any) -> dict[str, Any]:
     }
 
 
-def _reflection_status(run_dir: Path | None) -> dict[str, Any]:
-    candidates = (
-        [
-            path
-            for name in ("reflections", "reflection")
-            for path in [run_dir / name]
-            if path.exists()
-        ]
-        if run_dir is not None
-        else []
-    )
+def _reflection_status(plan: dict[str, Any] | None, expected: dict[str, Any]) -> dict[str, Any]:
+    """Describe reflection when state is absent without pretending it is clean."""
+    enabled = bool(((plan or {}).get("reflection") or {}).get("enabled"))
+    expected_segments = sum(len(chapter.get("segments", [])) for chapter in expected["chapters"])
     return {
-        "status": "unsupported",
+        "status": "missing" if enabled else "not_enabled",
+        "enabled": enabled,
         "reason": (
-            "WP2 reflection artifacts and the reflection evaluator are not available in this "
-            "code source; reflection quality is not reported as clean."
+            "no readable state; reflection artifacts cannot be evaluated"
+            if enabled
+            else "reflection is not enabled for this group"
         ),
-        "paths_present": [path.name for path in candidates],
+        "denominator": expected_segments,
+        "segments": {
+            "expected": expected_segments,
+            "current": 0,
+            "missing": expected_segments if enabled else 0,
+            "stale": 0,
+            "invalid": 0,
+            "ambiguous": 0,
+            "not_enabled": 0 if enabled else expected_segments,
+        },
+        "artifacts": {
+            "total": 0,
+            "current": 0,
+            "stale": 0,
+            "invalid": 0,
+            "ambiguous": 0,
+            "write_failed_events": 0,
+        },
+        "batches": [],
+        "adoption_counts": {},
+        "critique_counts": {},
+        "failure_counts": {},
     }
 
 
@@ -165,6 +181,7 @@ def _group_failure(
     expected: dict[str, Any],
     status: str,
     reason: str,
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     counts = _empty_counts(expected)
     counts[status if status in counts else "error"] = counts["expected"]
@@ -179,7 +196,7 @@ def _group_failure(
         "usage": None,
         "review": _review_summary(None),
         "events": {"total": 0, "failure_or_retry_counts": {}},
-        "reflection": _reflection_status(None),
+        "reflection": _reflection_status(plan, expected),
         "read_only_verified": True,
         "state_tree_sha256": None,
         "extracted_at": utc_now(),
@@ -191,6 +208,7 @@ def extract_group(
     group: str,
     state_dir: Path,
     expected: dict[str, Any],
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract one variant without writing to its state.
 
@@ -206,6 +224,7 @@ def extract_group(
             expected=expected,
             status="missing",
             reason="group state directory does not exist",
+            plan=plan,
         )
     before = hash_tree(state_dir)
     try:
@@ -216,6 +235,7 @@ def extract_group(
             expected=expected,
             status="missing",
             reason=f"no prepared run state: {type(error).__name__}: {error}",
+            plan=plan,
         )
     try:
         store = FileStorage(str(run_dir), create=False)
@@ -229,6 +249,7 @@ def extract_group(
             expected=expected,
             status="error",
             reason=f"run manifest is unreadable: {type(error).__name__}: {error}",
+            plan=plan,
         )
     if manifest.get("source_sha256") != expected["source_sha256"]:
         result = _group_failure(
@@ -236,6 +257,7 @@ def extract_group(
             expected=expected,
             status="stale",
             reason="source identity differs from the prepared snapshot",
+            plan=plan,
         )
         result["run_dir"] = str(run_dir)
         result["source_sha256"] = manifest.get("source_sha256")
@@ -248,6 +270,7 @@ def extract_group(
         review = store.load_latest_review_result()
         events = store.list_events(limit=0)
         chapters: list[dict[str, Any]] = []
+        loaded_chapters: dict[int, Any] = {}
         counts = {
             "expected": 0,
             "translated": 0,
@@ -269,6 +292,8 @@ def extract_group(
                     loaded = store.load_chapter(count)
                 except (OSError, ValueError, KeyError) as error:
                     load_error = str(error)
+            if loaded is not None:
+                loaded_chapters[count] = loaded
             actual = {segment.index: segment for segment in loaded.segments} if loaded else {}
             rows = []
             expected_indices = {item["index"] for item in expected_segments}
@@ -347,11 +372,28 @@ def extract_group(
             )
         review_summary = _review_summary(review)
         event_counts = _event_counts(events)
+        reflection_summary, reflection_segments = extract_reflection(
+            group=group,
+            plan=plan,
+            store=store,
+            run_dir=run_dir,
+            source_sha256=manifest.get("source_sha256") or "",
+            source_language=manifest.get("source_lang") or "",
+            target_language=manifest.get("target_lang") or "",
+            chapters=loaded_chapters,
+            expected=expected,
+            events=events,
+        )
     finally:
         store.close()
     after = hash_tree(state_dir)
     if before != after:
         raise CorruptIdentityError(f"Extraction modified group {group} state")
+    for chapter in chapters:
+        for row in chapter["segments"]:
+            evidence = reflection_segments.get((chapter["index"], row["segment"]))
+            if evidence is not None:
+                row["reflection"] = evidence
     status = "ok"
     if counts["error"]:
         status = "error"
@@ -372,7 +414,7 @@ def extract_group(
             "total": len(events),
             "failure_or_retry_counts": event_counts,
         },
-        "reflection": _reflection_status(run_dir),
+        "reflection": reflection_summary,
         "read_only_verified": True,
         "state_tree_sha256": before,
         "extracted_at": utc_now(),
@@ -388,13 +430,13 @@ def extract_all(
     snapshot_state = guard.child("_prepared", "state")
     expected = expected_inventory(snapshot_state)
     groups: dict[str, Any] = {}
-    for group in SUPPORTED_GROUPS:
-        plan = manifest["groups"][group]
+    for group, plan in manifest["groups"].items():
         try:
             groups[group] = extract_group(
                 group=group,
                 state_dir=Path(plan["state_dir"]),
                 expected=expected,
+                plan=plan,
             )
         except Exception as error:
             # Unexpected harness faults still keep the prepared denominator so a
@@ -404,6 +446,7 @@ def extract_all(
                 expected=expected,
                 status="error",
                 reason=f"{type(error).__name__}: {error}",
+                plan=plan,
             )
     result = {
         "protocol_version": EXTRACTION_PROTOCOL,

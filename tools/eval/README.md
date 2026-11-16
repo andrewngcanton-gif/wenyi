@@ -1,13 +1,12 @@
-# Wenyi evaluation harness (WP1a)
+# Wenyi evaluation harness
 
 This is an isolated, fork-only harness for exercising the Wenyi translation
 pipeline end to end. It is an independent uv project and is not a member of the
 repository workspace. It does not import UI, Web, Desktop, or BabelDOC code.
 
-WP1a is diagnostic until the owner freezes a clean A-prime commit. The offline
-smoke replaces only the external LLM client with a deterministic adapter; its
-outputs and costs are not translation-quality evidence and are not comparable
-with a real provider run.
+The harness records diagnostic and acceptance evidence. It is not a
+model-quality study: offline adapters and dirty or unfrozen code cannot support
+translation-quality, model-behavior or provider-cost conclusions.
 
 ## Commands
 
@@ -26,36 +25,127 @@ uv run --project tools/eval python -m wenyi_eval.run_variants run \
   --source /absolute/licensed/book.epub --license CC-BY-4.0 \
   --source-language ja --target-language zh \
   --config tools/eval/examples/ja-zh.yaml \
-  --baseline-code /absolute/read-only/baseline \
+  --baseline-code /absolute/read-only/upstream \
+  --wp0-code /absolute/read-only/wp0-baseline \
   --candidate-code /absolute/candidate \
   --candidate-sha <clean-candidate-commit> \
   --runs-dir /absolute/disposable/eval-runs \
   --candidate-executable /venv/bin/python --candidate-argv=-m --candidate-argv=wenyi_cli \
+  --wp0-executable /venv/bin/python --wp0-argv=-m --wp0-argv=wenyi_cli \
   --baseline-executable /venv/bin/python --baseline-argv=-m --baseline-argv=wenyi_cli
 ```
 
 `plan` writes the manifest using local CLI metadata commands without translating.
-`extract`, `export`,
-`import` and `report` rebuild later stages of an existing `--root`. Provider
-mode runs the selected product factory with no evaluation monkeypatch; the
-offline adapter is used only with an explicit `--adapter offline`. The
-executable and argv are the command that actually runs, and `models list
---json` / `models explain --operation` metadata is captured and redacted.
+`extract`, `export`, `import` and `report` rebuild later stages of an existing
+`--root`. Provider mode runs the selected product factory with no evaluation
+monkeypatch; the offline adapter is used only with an explicit `--adapter
+offline`. The executable and argv are the command that actually runs, and
+`models list --json` / `models explain --operation` metadata is captured and
+redacted.
 
-A user `--config` propagates to preparation and every group; the harness
-overlays only absolute state paths, the group's polish setting and Review
-settings. Credentials stay environment references (`api_key_env`) and literal
-credentials are rejected. Missing prices leave cost unknown instead of
-disabling extraction, sampling or reporting.
+## Three code bindings
 
-`import` reads the completed `samples/pairwise.csv` by default. Use `--ratings`
-to supply a separate completed copy of that same pairwise CSV format.
+The harness resolves exactly three source roles and never substitutes one for
+another:
 
-`--runs-dir` must be absolute. A run refuses to reuse a non-empty evaluation
-directory. The smoke expects the read-only baseline checkout at
-`.review/upstream` at commit `a27a176f42755432478a33db5af0dcf6a1649f97`; use
-`--baseline PATH` only for that same commit. The examples in `examples/` are
-consumable configuration inputs; no corpus is bundled.
+| Role | Default checkout | Groups |
+| --- | --- | --- |
+| `baseline` | `.review/upstream` at `a27a176f…` | `A`, `A2` |
+| `wp0` | `.review/wp0-baseline` at `4267537c…` | `A_prime`, `A_prime2`, `B` |
+| `candidate` | the current workspace | `C`, `C_keep`, `D` |
+
+`--baseline-code`, `--wp0-code` and `--candidate-code` overrides stay tied to
+their expected SHAs. Dirty, unpinned or mismatched bindings are recorded as
+`dirty`, `unfrozen` or `mismatch`; they are allowed only in diagnostic runs.
+The candidate is never relabeled as A-prime or claimed as a frozen quality
+candidate.
+
+## Groups and isolation
+
+The default selection preserves the historical five-group evaluation:
+`A,A2,A_prime,A_prime2,B`. Select an explicit subset with `--groups`, for
+example `--groups A,A_prime,C,C_keep,D`; only selected groups are planned, run,
+extracted and reported, so no unrequested paid run is added.
+
+- `A`/`A2` measure the upstream baseline and its rerun.
+- `A_prime`/`A_prime2` measure the frozen WP0 baseline and its rerun.
+- `B` matches A-prime except that polish is disabled.
+- `C` enables `reflective_polish` with `reflect_clean_batches=polish` and lets
+  `reflect.body` inherit its `polish.body` route.
+- `C_keep` changes only the clean-batch strategy to `keep`.
+- `D` is C plus an explicit heterogeneous `reflect.body` profile. Supply
+  `--heterogeneous-reflect-model <profile>` naming a profile in the user's
+  `llm.models`. The harness proves the resolved reflect and polish provider/model
+  identities differ; family heterogeneity stays an operator declaration. It
+  never invents a model ID or credential.
+- `E` remains the optional three-draft reference group and is not implemented.
+
+Control and legacy groups never receive WP2-only pipeline fields or
+`llm.routes.reflect.body`, even if the user configuration enables reflection.
+Requesting `C`, `C_keep` or `D` with a non-standard `translation_mode` fails
+explicitly.
+
+Each group has its own absolute config, state, output, cache, cwd, progress,
+result, status, inspect, and log paths under `runs/<eval-id>/<book>/<group>/`.
+Preparation runs once into `_prepared/`. The sanitized snapshot excludes body
+targets, usage/events, reviews, locks, and WAL sidecars; it is copied into each
+group's target state.
+
+## Preparation compatibility
+
+The persisted preparation contract is compared strictly against every selected
+group: source identity, target language, ingestion settings, analysis policy,
+analysis language policy and the prescan chapter-digest policy. Fingerprints are
+never relaxed to make reuse succeed.
+
+A full LLM configuration participates in the chapter-digest identity, so D's
+explicit reflect route can make the shared snapshot incompatible. When that
+happens the run aborts with a written incompatibility record unless
+`--allow-isolated-reprepare` is supplied. With that explicit authorization the
+harness prepares only the incompatible group under
+`<group>/_prepared/`, records a separate terminal and cost, and never
+overwrites shared or other-group state. D is described as runnable only when
+this isolated path is actually exercised.
+
+## Reflection evidence
+
+Extraction reads the current post-alignment chapters and delegates each
+artifact comparison to the product's `reflection_artifact_status`. The expected
+batch identity, policy fingerprints and configured route fingerprints are
+reconstructed independently from the group configuration, never copied from
+the artifact being validated.
+
+Every expected segment stays in the denominator. Per-segment and per-batch
+status is one of `current`, `stale`, `missing`, `invalid`, `ambiguous` or
+`not_enabled`:
+
+- `current` only means the record applies to the current text. It is never a
+  clean verdict and `skipped_no_turn` remains an outcome, not cleanliness.
+- stale, missing, invalid and ambiguous records are never counted as adoption.
+- duplicate or overlapping batch keys are not selected by mtime and are not
+  counted twice.
+- a diagnostic write failure is reported separately from a missing artifact.
+- untranslated (`None`) and intentionally empty (`""`) targets stay distinct.
+- ordinary baseline/B reflection is `not_enabled`.
+
+Reports include per-group reflection coverage, critique, adoption, failure and
+observed-route evidence. Missing or stale coverage makes the report fail; it is
+never silently dropped or treated as clean.
+
+## Human evaluation and cost
+
+Anonymous pairwise exports compare both the historical pairs and
+`A_prime` vs `C` / `C_keep` / `D` when those groups are selected. Blind packets
+carry opaque pair ids; the separate key maps ids to comparison and side groups.
+Missing ratings and missing/stale evidence remain in the preregistered
+denominator. Suggested rows are not executed reviews, and the export is
+described as anonymous, not double blind.
+
+Cost accounting uses an inclusive input partition. Cache reads, writes,
+uncached input and unclassified input must add up to the prompt total. A
+missing counter stays unknown, and unclassified input is only priced when the
+declared rule proves every allocation has the same rate. Unknown prices stay
+unknown, never zero. Isolated preparation is charged as its own scope.
 
 ## Layout and modules
 
@@ -68,8 +158,9 @@ tools/eval/
   wenyi_eval/
     manifest.py        # identities, explicit argv/paths, group bindings
     sample.py          # pilot selection and stratified human-review packets
-    run_variants.py    # prepare once, seed snapshots, run five groups
+    run_variants.py    # prepare once, seed snapshots, run selected groups
     extract.py         # public FileStorage reads aligned by source/index
+    reflection.py      # WP2 artifact identity and status evidence
     pairwise.py        # anonymous pairwise export and rating import
     cost.py            # operation ledger, cache/time, unknown-not-zero cost
     report.py          # Markdown/CSV report and tri-state conclusion
@@ -80,61 +171,23 @@ first on `sys.path` and replaces `build_client` only. The CLI, orchestrator,
 storage, receipts, and terminal records are the selected product code. A binding
 record proves which `wenyi_core` and `wenyi_cli` modules were imported.
 
-## Groups and isolation
-
-Supported groups are `A`, `A2`, `A_prime`, `A_prime2`, and `B`. `A`/`A2` use the
-read-only baseline checkout; `A_prime`/`A_prime2` use the candidate checkout and
-must not be the same source. `B` matches A-prime except that polish is disabled
-in both its template and its CLI arguments. Rerun groups estimate variability,
-not a new treatment.
-
-`C`, `C_keep`, and `D` require the WP2 reflective-polish implementation; `E` is
-the optional three-draft reference and is not implemented. Templates exist for
-later use, but requesting these groups fails explicitly.
-
-Each group has its own absolute config, state, output, cache, cwd, progress,
-result, status, inspect, and log paths under
-`runs/<eval-id>/<book>/<group>/`. Preparation runs once through A-prime into
-`_prepared/`. The sanitized snapshot excludes body targets, usage/events,
-reviews, locks, and WAL sidecars; it is copied into each group's target state.
-The CLI then reuses prepared state instead of paying for preparation again.
-Manifest routes, route fingerprints, model parameters, prices, and other
-unavailable values are recorded as explicit `unknown`, never invented or zero.
-
-## Evidence and conclusions
-
-Extraction uses public `FileStorage` reads keyed by `source_sha256`, chapter, and
-stable segment index. Every expected segment stays in the denominator. A
-missing group, source-identity mismatch or unreadable chapter is reported as
-`missing`, `stale` or `error` with a reason; stale text is never presented as a
-current target. An untranslated target (`None`) stays distinct from an
-intentional empty target (`""`). Before translation, the prepared snapshot's
-ingestion settings, analysis policy and prescan digest policy are compared with
-each group's configuration. An incompatible snapshot aborts with a written
-incompatibility record rather than being silently reused.
-
-Cost accounting uses an inclusive input partition. Cache reads, writes,
-uncached input and unclassified input must add up to the prompt total. A
-missing counter stays unknown, and unclassified input is only priced when the
-declared rule proves every allocation has the same rate; it is never defaulted
-to ordinary input pricing. Empty or incomplete ledgers produce an unknown cost.
-Reflection artifacts are unavailable in WP1a and are reported as `unsupported`,
-never as clean. Suggested human-review rows are not executed reviews. Pairwise
-ratings start blank; missing ratings remain missing and use the preregistered
-denominator.
-
 The report is `report/summary.md` with `report/report.json`,
 `report/group_summary.csv`, `report/human_summary.csv`, `report/cost.json`, and
 `report/stage_costs.csv`. The conclusion is `passed`, `failed`, or
-`inconclusive`; missing metrics never pass. Offline smoke runs are always
-`inconclusive`.
+`inconclusive`; missing metrics never pass. Diagnostic runs are always
+`inconclusive` unless an execution check fails.
 
 ## Known limits
 
-- A-prime is not frozen; the smoke records an `unfrozen` binding and cannot be a
-  real comparison.
+- The current workspace carries uncommitted WP2 code; C/C_keep/D are diagnostic
+  and unfrozen, not quality candidates.
 - No licensed corpus, human ratings, provider price rules, or provider usage is
   bundled. Only the synthetic CC0 fixture is used.
-- The external model boundary is replaced in smoke runs. No network access or
-  credentials are used.
-- WP2 reflection is unsupported, and C/C_keep/D/E are not runnable.
+- Every model boundary in local acceptance is a deterministic adapter or a local
+  HTTP stub. No network access, credential or paid endpoint is used.
+- The harness verifies that D's resolved reflect and polish identities differ;
+  it cannot independently verify semantic model-family heterogeneity.
+- Reflection expected policy and routes are reconstructed with the wenyi-core
+  installed in `tools/eval`. A run produced by a different candidate should be
+  re-extracted with that candidate's harness environment, otherwise records are
+  honestly reported as stale.

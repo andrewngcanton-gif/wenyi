@@ -18,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .common import (
     CorruptIdentityError,
@@ -42,6 +42,7 @@ from .manifest import (
     credential_env_names,
     load_group_template,
     load_manifest,
+    preparation_group,
     require_frozen_bindings,
     require_real_ready,
     validate_manifest,
@@ -55,8 +56,9 @@ from .snapshot import (
     expected_preparation_identity,
     find_run_dir,
     preparation_identity,
-    read_snapshot_receipt,
+    read_snapshot_receipt_at,
     seed_state,
+    write_group_prepare_config,
     write_prepare_config,
 )
 
@@ -116,10 +118,16 @@ class TerminalStore:
             rows.append(row)
         return rows
 
-    def validate_complete(self) -> dict[tuple[str, str], dict[str, Any]]:
+    def validate_complete(
+        self,
+        groups: Iterable[str] | None = None,
+        isolated_preparations: Iterable[str] = (),
+    ) -> dict[tuple[str, str], dict[str, Any]]:
         rows = self.read_all()
+        selected = tuple(groups) if groups is not None else SUPPORTED_GROUPS
         expected = {("preparation", "prepare")}
-        expected.update((group, stage) for group in SUPPORTED_GROUPS for stage in GROUP_STAGES)
+        expected.update(("preparation", f"prepare.{group}") for group in isolated_preparations)
+        expected.update((group, stage) for group in selected for stage in GROUP_STAGES)
         seen: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
             key = (row["group"], row["stage"])
@@ -350,29 +358,33 @@ def _usage_from_state(run_dir: Path) -> dict[str, Any] | None:
         store.close()
 
 
-def prepare(
+def _prepare_once(
     *,
     root: Path,
     manifest: dict[str, Any],
     source: Path,
     terminals: TerminalStore,
     timeout: float,
-    base_config: dict[str, Any] | None = None,
+    plan: dict[str, Any],
+    config: Path,
+    stage: str,
+    prepared_root: Path,
+    record_path: Path,
 ) -> dict[str, Any]:
-    plans = manifest["groups"]
-    plan = plans["A_prime"]
-    config = write_prepare_config(root, base_config=base_config)
-    binding_path = root / "_prepared" / "binding.prepare.json"
-    stdout_path = root / "_prepared" / "logs" / "prepare.stdout.log"
-    stderr_path = root / "_prepared" / "logs" / "prepare.stderr.log"
+    """Run one preparation subprocess and build its sanitized snapshot."""
+    guard = PathGuard(root)
+    prepared_root = guard.ensure(prepared_root)
+    binding_path = prepared_root / "binding.prepare.json"
+    stdout_path = prepared_root / "logs" / "prepare.stdout.log"
+    stderr_path = prepared_root / "logs" / "prepare.stderr.log"
     source_hash = sha256_file(source)
     outcome, logs = run_child(
         group="preparation",
-        stage="prepare",
+        stage=stage,
         plan=plan,
         config=str(config),
         argv=["prepare", str(source)],
-        cwd=root / "_prepared" / "cwd",
+        cwd=prepared_root / "cwd",
         binding_path=binding_path,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
@@ -381,7 +393,7 @@ def prepare(
     terminal_path = terminals.write(logs["terminal"])
     if outcome.exit_code != 0 or not outcome.binding_valid:
         raise EvalError(f"Preparation failed ({logs['terminal']['status']}); see {stderr_path}")
-    staging = root / "_prepared" / "staging"
+    staging = prepared_root / "staging"
     run_dir = find_run_dir(staging)
     try:
         run_relative_path = run_dir.relative_to(staging).as_posix()
@@ -395,20 +407,24 @@ def prepare(
         run_dir=run_dir,
         expected_source_sha256=source_hash,
         expected_target_lang=manifest["source"]["language"]["target"],
+        snapshot_dir=prepared_root,
     )
     record = {
         "protocol_version": TERMINAL_PROTOCOL,
         "stage": "preparation",
+        "terminal_stage": stage,
         "terminal_path": str(terminal_path),
         "terminal_status": logs["terminal"]["status"],
         "adapter": plan["adapter"],
         "executable": plan["executable"],
         "argv_prefix": plan["argv_prefix"],
+        "group": plan.get("group_key"),
         "source_sha256": source_hash,
         "source_unchanged": sha256_file(source) == source_hash,
         "run_dir": str(run_dir),
         "run_relative_path": run_relative_path,
         "snapshot": snapshot,
+        "snapshot_dir": str(prepared_root),
         "usage": usage,
         "usage_source": (
             "synthetic_offline_adapter; not provider metering"
@@ -426,7 +442,77 @@ def prepare(
         },
         "records_preparation_cost_only": True,
     }
+    write_json_atomic(record_path, record)
+    return record
+
+
+def prepare(
+    *,
+    root: Path,
+    manifest: dict[str, Any],
+    source: Path,
+    terminals: TerminalStore,
+    timeout: float,
+    base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+) -> dict[str, Any]:
+    producer = preparation_group(manifest["groups"])
+    plan = dict(manifest["groups"][producer])
+    plan["group_key"] = producer
+    config = write_prepare_config(
+        root, group=producer, base_config=base_config, reflect_model=reflect_model
+    )
+    record = _prepare_once(
+        root=root,
+        manifest=manifest,
+        source=source,
+        terminals=terminals,
+        timeout=timeout,
+        plan=plan,
+        config=config,
+        stage="prepare",
+        prepared_root=root / "_prepared",
+        record_path=root / "_prepared" / "preparation.json",
+    )
+    record["producer_group"] = producer
+    record["isolated"] = False
     write_json_atomic(root / "_prepared" / "preparation.json", record)
+    return record
+
+
+def prepare_isolated(
+    *,
+    root: Path,
+    manifest: dict[str, Any],
+    group: str,
+    source: Path,
+    terminals: TerminalStore,
+    timeout: float,
+    base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+) -> dict[str, Any]:
+    """Prepare one group's incompatible contract without touching shared state."""
+    guard = PathGuard(root)
+    plan = dict(manifest["groups"][group])
+    plan["group_key"] = group
+    config = write_group_prepare_config(
+        root, group, base_config=base_config, reflect_model=reflect_model
+    )
+    record = _prepare_once(
+        root=root,
+        manifest=manifest,
+        source=source,
+        terminals=terminals,
+        timeout=timeout,
+        plan=plan,
+        config=config,
+        stage=f"prepare.{group}",
+        prepared_root=guard.child(group, "_prepared"),
+        record_path=guard.child(group, "_prepared", "preparation.json"),
+    )
+    record["producer_group"] = group
+    record["isolated"] = True
+    write_json_atomic(guard.child(group, "_prepared", "preparation.json"), record)
     return record
 
 
@@ -500,7 +586,11 @@ def _translate_arguments(
     output: Path,
     plan: dict[str, Any],
 ) -> list[str]:
-    polish = bool(load_group_template(group)["pipeline"].get("polish"))
+    polish = (
+        plan["polish"]
+        if isinstance(plan.get("polish"), bool)
+        else bool(load_group_template(group)["pipeline"].get("polish"))
+    )
     return [
         "translate",
         str(source),
@@ -520,17 +610,21 @@ def _translate_arguments(
 
 
 def check_preparation_compatibility(
-    *, root: Path, manifest: dict[str, Any], source_hash: str
+    *,
+    root: Path,
+    manifest: dict[str, Any],
+    source_hash: str,
+    allow_isolated_reprepare: bool = False,
 ) -> dict[str, Any]:
     """Compare the shared snapshot with each group's persisted preparation contract.
 
-    A mismatch aborts before any translation because the harness does not
-    silently re-prepare paid work or reuse incompatible state.
+    A mismatch aborts before any translation unless isolated re-preparation was
+    explicitly authorized. Persisted fingerprints are never relaxed to make a
+    reuse succeed, and an isolated run never overwrites the shared snapshot.
     """
     actual = preparation_identity(root / "_prepared" / "state")
     groups: dict[str, Any] = {}
-    for group in SUPPORTED_GROUPS:
-        plan = manifest["groups"][group]
+    for group, plan in manifest["groups"].items():
         try:
             expected = expected_preparation_identity(
                 plan["config"],
@@ -546,15 +640,26 @@ def check_preparation_compatibility(
         except Exception as error:
             reasons = [f"group configuration cannot be resolved: {type(error).__name__}: {error}"]
             expected_summary = None
+        if reasons and allow_isolated_reprepare:
+            status = "isolated_required"
+            reprepare = "authorized: an isolated preparation will run under the group directory"
+            cost = "separate preparation cost; never attributed to the shared snapshot"
+        elif reasons:
+            status = "incompatible"
+            reprepare = "not attempted; pass --allow-isolated-reprepare to authorize one"
+            cost = "not incurred; translation did not start"
+        else:
+            status = "reused"
+            reprepare = "not required"
+            cost = "not incurred"
         groups[group] = {
-            "status": "incompatible" if reasons else "reused",
+            "status": status,
             "reasons": reasons,
             "fingerprint": actual.get("fingerprint"),
             "expected": expected_summary,
-            "reprepare": "not attempted; no safe isolated reparation is supported"
-            if reasons
-            else "not required",
-            "cost": "not incurred" if not reasons else "unknown; translation did not start",
+            "reprepare": reprepare,
+            "cost": cost,
+            "snapshot": "shared",
         }
     payload = {
         "protocol_version": TERMINAL_PROTOCOL,
@@ -563,7 +668,9 @@ def check_preparation_compatibility(
         "groups": groups,
         "translation_started": False,
     }
-    incompatible = {key: value for key, value in groups.items() if value["reasons"]}
+    incompatible = {
+        key: value for key, value in groups.items() if value["status"] == "incompatible"
+    }
     if incompatible:
         path = root / "records" / "preparation_incompatibility.json"
         write_json_atomic(path, payload)
@@ -572,6 +679,7 @@ def check_preparation_compatibility(
         )
         raise PreparationIncompatibilityError(
             f"Prepared state is incompatible with {len(incompatible)} group(s): {detail}. "
+            "Pass --allow-isolated-reprepare to prepare those groups in isolation, or abort. "
             f"Incompatibility record: {path}"
         )
     payload["translation_started"] = True
@@ -589,6 +697,8 @@ def run_group(
     timeout: float,
     output: Path,
     preparation: dict[str, Any],
+    prepared: dict[str, Any],
+    snapshot_dir: Path,
 ) -> dict[str, Any]:
     plan = manifest["groups"][group]
     guard = PathGuard(root)
@@ -597,8 +707,7 @@ def run_group(
     for field in ("progress_path", "result_path", "status_path", "inspect_path"):
         Path(plan[field]).parent.mkdir(parents=True, exist_ok=True)
 
-    snapshot = read_snapshot_receipt(root)
-    prepared_record = read_json(root / "_prepared" / "preparation.json")
+    snapshot = read_snapshot_receipt_at(snapshot_dir)
     source_hash = sha256_file(source)
     if snapshot.get("source_sha256") != source_hash:
         raise EvalError(
@@ -610,12 +719,12 @@ def run_group(
             f"Prepared state is incompatible with group {group}: target language differs; "
             "re-prepare is required and its cost must be recorded explicitly"
         )
-    run_relative_path = prepared_record.get("run_relative_path")
+    run_relative_path = prepared.get("run_relative_path")
     if not isinstance(run_relative_path, str) or not run_relative_path:
         raise CorruptIdentityError("Preparation record has no run-relative state path")
     destination = guard.child(group, "state", *run_relative_path.split("/"))
     seed_state(
-        guard.child("_prepared", "state"),
+        Path(snapshot_dir) / "state",
         destination,
         expected_digest=snapshot["tree_sha256"],
     )
@@ -679,6 +788,8 @@ def run_group(
         "state_dir": plan["state_dir"],
         "output": str(output),
         "preparation": preparation["groups"][group],
+        "prepared_snapshot": str(snapshot_dir),
+        "prepared_isolated": bool(prepared.get("isolated")),
         "translate_terminal": str(translate_path),
         "receipt_validation": validation,
         "exit_codes": {
@@ -702,6 +813,8 @@ def execute(
     terminals: TerminalStore,
     timeout: float,
     base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+    allow_isolated_reprepare: bool = False,
 ) -> dict[str, Any]:
     source_hash = sha256_file(source)
     if source_hash != manifest["source"]["sha256"]:
@@ -713,18 +826,59 @@ def execute(
         terminals=terminals,
         timeout=timeout,
         base_config=base_config,
+        reflect_model=reflect_model,
     )
     compatibility = check_preparation_compatibility(
-        root=root, manifest=manifest, source_hash=source_hash
+        root=root,
+        manifest=manifest,
+        source_hash=source_hash,
+        allow_isolated_reprepare=allow_isolated_reprepare,
     )
+    isolated: dict[str, Any] = {}
+    isolated_groups = [
+        group
+        for group, entry in compatibility["groups"].items()
+        if entry["status"] == "isolated_required"
+    ]
+    for group in isolated_groups:
+        record = prepare_isolated(
+            root=root,
+            manifest=manifest,
+            group=group,
+            source=source,
+            terminals=terminals,
+            timeout=timeout,
+            base_config=base_config,
+            reflect_model=reflect_model,
+        )
+        isolated[group] = record
+        compatibility["groups"][group]["snapshot"] = "isolated"
+        compatibility["groups"][group]["status"] = "isolated"
+        compatibility["groups"][group]["reprepare"] = "completed in an isolated group snapshot"
+        compatibility["groups"][group]["isolated_snapshot"] = record["snapshot_dir"]
+        compatibility["groups"][group]["isolated_terminal"] = record["terminal_path"]
+        compatibility["groups"][group]["isolated_fingerprint"] = record["snapshot"]["tree_sha256"]
+        compatibility["groups"][group]["cost"] = record["cost"]
+    if isolated_groups:
+        compatibility["translation_started"] = True
+        write_json_atomic(root / "records" / "preparation_compatibility.json", compatibility)
     snapshot_before = preparation["snapshot"]["tree_sha256"]
+    isolated_before = {
+        group: hash_tree(Path(record["snapshot_dir"]) / "state")
+        for group, record in isolated.items()
+    }
     if sha256_file(source) != source_hash:
         raise CorruptIdentityError("Fixture source changed during preparation")
     groups: dict[str, Any] = {}
     output_name = f"{source.stem}.zh.txt"
-    for group in SUPPORTED_GROUPS:
-        plan = manifest["groups"][group]
+    for group, plan in manifest["groups"].items():
         output = Path(plan["output_dir"]) / output_name
+        if group in isolated:
+            snapshot_dir = Path(isolated[group]["snapshot_dir"])
+            prepared = isolated[group]
+        else:
+            snapshot_dir = Path(preparation["snapshot_dir"])
+            prepared = preparation
         groups[group] = run_group(
             root=root,
             manifest=manifest,
@@ -734,19 +888,28 @@ def execute(
             timeout=timeout,
             output=output,
             preparation=compatibility,
+            prepared=prepared,
+            snapshot_dir=snapshot_dir,
         )
     if sha256_file(source) != source_hash:
         raise CorruptIdentityError("Fixture source changed during execution")
-    snapshot = read_snapshot_receipt(root)
+    snapshot = read_snapshot_receipt_at(Path(preparation["snapshot_dir"]))
     if not snapshot.get("tree_sha256"):
         raise CorruptIdentityError("Preparation snapshot receipt has no digest")
-    snapshot_after = hash_tree(root / "_prepared" / "state")
+    snapshot_after = hash_tree(Path(preparation["snapshot_dir"]) / "state")
     if snapshot_after != snapshot_before or snapshot.get("tree_sha256") != snapshot_before:
         raise CorruptIdentityError("Preparation snapshot changed during variant runs")
-    rows = terminals.validate_complete()
-    _validate_receipt_identities(rows)
+    for group, record in isolated.items():
+        current = hash_tree(Path(record["snapshot_dir"]) / "state")
+        if current != isolated_before[group]:
+            raise CorruptIdentityError(f"Isolated preparation snapshot for {group} changed")
+    rows = terminals.validate_complete(
+        groups=manifest["groups"], isolated_preparations=isolated_groups
+    )
+    _validate_receipt_identities(rows, manifest["groups"])
     return {
         "preparation": preparation,
+        "isolated_preparation": isolated,
         "preparation_compatibility": compatibility,
         "groups": groups,
         "terminals": {f"{group}.{stage}": row for (group, stage), row in rows.items()},
@@ -756,9 +919,11 @@ def execute(
     }
 
 
-def _validate_receipt_identities(rows: dict[tuple[str, str], dict[str, Any]]) -> None:
+def _validate_receipt_identities(
+    rows: dict[tuple[str, str], dict[str, Any]], groups: Iterable[str]
+) -> None:
     run_ids: dict[str, str] = {}
-    for group in SUPPORTED_GROUPS:
+    for group in groups:
         terminal = rows[(group, "translate")]
         validation = terminal.get("receipt_validation") or {}
         if validation.get("status") != "valid":
@@ -836,13 +1001,15 @@ def capture_runtime_metadata(
     PathGuard(root).child("records").mkdir(parents=True, exist_ok=True)
     binding_cache: dict[str, dict[str, Any]] = {}
     for key, plan in plans.items():
+        reflective = bool((plan.get("reflection") or {}).get("enabled"))
+        reflect_status = "unknown" if reflective else "not_enabled"
         if plan["adapter"] == "offline":
             plan["routes"] = {
                 "status": "unknown",
                 "reason": "the explicit offline adapter does not expose provider routes",
                 "translation.body": "unknown",
                 "polish.body": "disabled" if not plan["polish"] else "unknown",
-                "reflect.body": "unsupported",
+                "reflect.body": reflect_status,
             }
             plan["route_fingerprints"] = {
                 "status": "unknown",
@@ -867,13 +1034,24 @@ def capture_runtime_metadata(
                 reasons.append(f"{operation}: {explain_error}")
             else:
                 operations[operation] = redact_metadata(described)
+        if reflective:
+            described, explain_error = _run_metadata_command(
+                plan=plan,
+                config=config,
+                argv=["models", "explain", "--operation", "reflect.body"],
+                timeout=timeout,
+            )
+            if explain_error:
+                reasons.append(f"reflect.body: {explain_error}")
+            else:
+                operations["reflect.body"] = redact_metadata(described)
         if listed is None or reasons:
             plan["routes"] = {
                 "status": "unknown",
                 "reason": "; ".join(reasons)[:2000] or "model route metadata is unavailable",
                 "translation.body": "unknown",
                 "polish.body": "disabled" if not plan["polish"] else "unknown",
-                "reflect.body": "unsupported",
+                "reflect.body": reflect_status,
             }
             plan["route_fingerprints"] = {
                 "status": "unknown",
@@ -887,7 +1065,7 @@ def capture_runtime_metadata(
             "polish.body": "disabled"
             if not plan["polish"]
             else routes.get("polish.body", "unknown"),
-            "reflect.body": "unsupported",
+            "reflect.body": routes.get("reflect.body", "unknown") if reflective else "not_enabled",
             "operations": operations,
             "listed": routes,
         }
@@ -895,6 +1073,28 @@ def capture_runtime_metadata(
             "status": "known",
             "fingerprint": sha256_text(json.dumps(operations, sort_keys=True)),
         }
+        if reflective:
+            reflect = routes.get("reflect.body") or {}
+            polish = routes.get("polish.body") or {}
+            inherited = reflect.get("origin") == "inherits polish.body"
+            same_model = (
+                reflect.get("model") is not None
+                and reflect.get("model") == polish.get("model")
+                and reflect.get("provider") == polish.get("provider")
+            )
+            plan["reflection"]["observed_route"] = {
+                "reflect_model": reflect.get("model"),
+                "reflect_provider": reflect.get("provider"),
+                "polish_model": polish.get("model"),
+                "polish_provider": polish.get("provider"),
+                "reflect_origin": reflect.get("origin"),
+                "separation": "inherited" if inherited else ("same" if same_model else "distinct"),
+                "source": "wenyi models list --json",
+            }
+            if key == "D" and same_model:
+                raise EvalError(
+                    "Group D reflect.body and polish.body resolve to the same model identity"
+                )
         if plan["code_source"] not in binding_cache:
             binding_path = PathGuard(root).child(
                 "records",
@@ -925,9 +1125,13 @@ def prepare_manifest(
     repo_root: Path,
     timeout: float = 900.0,
     base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
 ) -> dict[str, Any]:
     """Bind configs, capture real routes and commit the manifest exactly once."""
-    config_hashes = write_variant_configs(root, base_config=base_config)
+    groups = tuple(manifest["groups"])
+    config_hashes = write_variant_configs(
+        root, base_config=base_config, groups=groups, reflect_model=reflect_model
+    )
     manifest["root"] = str(root)
     for key, group in manifest["groups"].items():
         group["config_sha256"] = config_hashes[key]
@@ -935,8 +1139,9 @@ def prepare_manifest(
         require_frozen_bindings(manifest)
     capture_runtime_metadata(root=root, plans=manifest["groups"])
     validate_manifest(manifest, repo_root=repo_root)
-    manifest["llm"]["routes"] = manifest["groups"]["A_prime"]["routes"]
-    manifest["llm"]["route_fingerprints"] = manifest["groups"]["A_prime"]["route_fingerprints"]
+    producer = manifest["preparation"]["producer_group"]
+    manifest["llm"]["routes"] = manifest["groups"][producer]["routes"]
+    manifest["llm"]["route_fingerprints"] = manifest["groups"][producer]["route_fingerprints"]
     if not manifest.get("diagnostic"):
         require_real_ready(manifest)
     write_manifest(root, manifest)
@@ -950,6 +1155,8 @@ def execute_planned(
     source: Path,
     timeout: float,
     base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+    allow_isolated_reprepare: bool = False,
 ) -> dict[str, Any]:
     execution = execute(
         root=root,
@@ -958,6 +1165,8 @@ def execute_planned(
         terminals=TerminalStore(root),
         timeout=timeout,
         base_config=base_config,
+        reflect_model=reflect_model,
+        allow_isolated_reprepare=allow_isolated_reprepare,
     )
     write_json_atomic(root / "records" / "execution.json", execution)
     return execution
@@ -971,6 +1180,8 @@ def start_evaluation(
     repo_root: Path,
     timeout: float = 900.0,
     base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+    allow_isolated_reprepare: bool = False,
 ) -> dict[str, Any]:
     """Write the manifest and run all variants inside an already initialized root."""
     loaded = prepare_manifest(
@@ -979,6 +1190,7 @@ def start_evaluation(
         repo_root=repo_root,
         timeout=timeout,
         base_config=base_config,
+        reflect_model=reflect_model,
     )
     execution = execute_planned(
         root=root,
@@ -986,6 +1198,8 @@ def start_evaluation(
         source=source,
         timeout=timeout,
         base_config=base_config,
+        reflect_model=reflect_model,
+        allow_isolated_reprepare=allow_isolated_reprepare,
     )
     return {
         "root": root,
@@ -1041,7 +1255,16 @@ def _build_evaluation(
     """Create one evaluation root from CLI arguments, optionally executing it."""
     from .cost import load_prices
     from .fixture import fixture_metadata
-    from .manifest import BASELINE_SHA, build_group_plans, build_manifest, load_user_config
+    from .manifest import (
+        BASELINE_SHA,
+        DEFAULT_GROUPS,
+        REFLECTIVE_GROUPS,
+        WP0_SHA,
+        build_group_plans,
+        build_manifest,
+        load_user_config,
+        normalize_groups,
+    )
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else _repo_root()
     runs_dir = resolve_absolute(args.runs_dir, label="--runs-dir")
@@ -1050,6 +1273,12 @@ def _build_evaluation(
         raise EvalError(f"Source does not exist: {source}")
     if not args.license:
         raise EvalError("--license is required so the source provenance is explicit")
+    requested = normalize_groups(args.groups or DEFAULT_GROUPS)
+    if "D" in requested and not args.heterogeneous_reflect_model:
+        raise EvalError(
+            "Group D requires --heterogeneous-reflect-model naming a model profile defined by "
+            "the user configuration; no model ID is invented"
+        )
     diagnostic = bool(args.diagnostic or args.adapter == "offline")
     if not diagnostic and not args.candidate_sha:
         raise EvalError("A real comparison requires --candidate-sha for the candidate code source")
@@ -1062,18 +1291,29 @@ def _build_evaluation(
         copied = root / "source" / source.name
         copied.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, copied)
-        config_hashes = write_variant_configs(root, base_config=base_config)
+        config_hashes = write_variant_configs(
+            root,
+            base_config=base_config,
+            groups=requested,
+            reflect_model=args.heterogeneous_reflect_model,
+        )
         plans = build_group_plans(
             root,
             baseline_source=Path(args.baseline_code)
             if args.baseline_code
             else _default_baseline(repo_root),
+            wp0_source=Path(args.wp0_code) if args.wp0_code else _default_wp0(repo_root),
             candidate_source=Path(args.candidate_code or repo_root),
             baseline_expected_sha=args.baseline_sha or BASELINE_SHA,
+            wp0_expected_sha=args.wp0_sha or WP0_SHA,
             candidate_expected_sha=args.candidate_sha or "unfrozen",
             diagnostic=diagnostic,
+            requested_groups=requested,
             baseline_binding=_binding_from_args(args, "baseline"),
+            wp0_binding=_binding_from_args(args, "wp0"),
             candidate_binding=_binding_from_args(args, "candidate"),
+            base_config=base_config,
+            reflect_model=args.heterogeneous_reflect_model,
         )
         fixture = (
             fixture_metadata()
@@ -1097,9 +1337,30 @@ def _build_evaluation(
             notes.append(
                 "Diagnostic run: results do not support translation-quality or provider-cost claims."
             )
+        candidate_groups = [group for group in requested if group in REFLECTIVE_GROUPS]
+        if candidate_groups:
+            notes.append(
+                "C/C_keep/D bind the current workspace source; its dirty or unfrozen identity is "
+                "diagnostic and is not a frozen quality candidate or an A_prime relabel."
+            )
+            notes.append(
+                "Reflection artifacts are diagnostic records; a current artifact is not a clean "
+                "quality verdict."
+            )
+        if "D" in requested:
+            notes.append(
+                "D family heterogeneity is operator-declared; the harness verifies only that the "
+                "resolved reflect.body and polish.body identities differ."
+            )
+        if args.allow_isolated_reprepare:
+            notes.append(
+                "Incompatible preparation contracts may run isolated preparation under the group "
+                "directory; that cost is charged separately and never reuses incompatible state."
+            )
         if args.candidate_sha in (None, "unfrozen"):
             notes.append("The candidate code SHA is unfrozen and cannot support a real comparison.")
         notes.extend(args.unknown_note or [])
+        producer = preparation_group(plans)
         manifest = build_manifest(
             root=root,
             runs_dir=runs_dir,
@@ -1117,7 +1378,7 @@ def _build_evaluation(
             seed=args.seed,
             prices=load_prices(args.prices),
             preparation_entry=(
-                f"{plans['A_prime']['code_source']} prepare via {plans['A_prime']['executable']}"
+                f"{plans[producer]['code_source']} prepare via {plans[producer]['executable']}"
             ),
             unknown_notes=notes,
             user_config=(
@@ -1133,6 +1394,7 @@ def _build_evaluation(
             repo_root=repo_root,
             timeout=args.timeout,
             base_config=base_config,
+            reflect_model=args.heterogeneous_reflect_model,
         )
         execution = None
         if execute_after:
@@ -1142,6 +1404,8 @@ def _build_evaluation(
                 source=copied,
                 timeout=args.timeout,
                 base_config=base_config,
+                reflect_model=args.heterogeneous_reflect_model,
+                allow_isolated_reprepare=args.allow_isolated_reprepare,
             )
     return root, loaded, execution
 
@@ -1187,6 +1451,15 @@ def _default_baseline(repo_root: Path) -> Path:
     )
 
 
+def _default_wp0(repo_root: Path) -> Path:
+    from .manifest import WP0_REF
+
+    for candidate in (repo_root / WP0_REF, repo_root.parent / WP0_REF):
+        if candidate.is_dir():
+            return candidate
+    raise EvalError(f"Cannot find the frozen WP0 checkout at {WP0_REF}; pass --wp0-code")
+
+
 def _load_root_manifest(root: str) -> tuple[Path, dict[str, Any]]:
     resolved = resolve_absolute(root, label="--root")
     return resolved, load_manifest(resolved / "manifest.json")
@@ -1206,9 +1479,29 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo-root", default=None, help="Repository root for baseline checks")
     parser.add_argument("--baseline-code", default=None, help="Read-only baseline checkout")
     parser.add_argument("--baseline-sha", default=None, help="Expected baseline commit")
+    parser.add_argument("--wp0-code", default=None, help="Frozen WP0 checkout")
+    parser.add_argument("--wp0-sha", default=None, help="Expected WP0 commit")
     parser.add_argument("--candidate-code", default=None, help="Candidate code source")
     parser.add_argument(
         "--candidate-sha", default=None, help="Expected candidate commit (required for real runs)"
+    )
+    parser.add_argument(
+        "--groups",
+        default=None,
+        help=(
+            "Comma-separated groups (default: A,A2,A_prime,A_prime2,B). "
+            "C/C_keep/D add reflective polish; E is not implemented."
+        ),
+    )
+    parser.add_argument(
+        "--heterogeneous-reflect-model",
+        default=None,
+        help="Model profile used as D's explicit reflect.body route",
+    )
+    parser.add_argument(
+        "--allow-isolated-reprepare",
+        action="store_true",
+        help="Authorize isolated re-preparation for incompatible preparation contracts",
     )
     parser.add_argument("--config", default=None, help="User configuration YAML")
     parser.add_argument("--prices", default=None, help="Optional provider price rule JSON")
@@ -1241,6 +1534,15 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         help="Repeatable argv element preceding the Wenyi command for the candidate",
+    )
+    parser.add_argument(
+        "--wp0-executable", default=None, help="Interpreter that runs the frozen WP0 source"
+    )
+    parser.add_argument(
+        "--wp0-argv",
+        action="append",
+        default=[],
+        help="Repeatable argv element preceding the Wenyi command for WP0",
     )
     parser.add_argument(
         "--unknown-note", action="append", default=[], help="Explicit known limitation"

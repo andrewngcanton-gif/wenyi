@@ -32,13 +32,14 @@ from .common import (
 PROTOCOL_VERSION = 1
 BASELINE_SHA = "a27a176f42755432478a33db5af0dcf6a1649f97"
 BASELINE_REF = ".review/upstream"
-SUPPORTED_GROUPS = ("A", "A2", "A_prime", "A_prime2", "B")
-UNSUPPORTED_GROUPS = {
-    "C": "reflective polish requires the WP2 implementation",
-    "C_keep": "reflective polish with clean batches kept requires the WP2 implementation",
-    "D": "heterogeneous reflect.body routing requires the WP2 implementation",
-    "E": "the optional three-draft reference group is not implemented",
-}
+# Frozen WP0 checkout. A_prime/A_prime2/B compare against this clean source,
+# never against the mutable working tree that carries WP2.
+WP0_SHA = "4267537c9f28208606282f5ec085d723c3c270bc"
+WP0_REF = ".review/wp0-baseline"
+# Sources are distinct bindings: upstream baseline, frozen WP0, current workspace.
+SOURCE_ROLES = ("baseline", "wp0", "candidate")
+REFLECTIVE_GROUPS = ("C", "C_keep", "D")
+UNSUPPORTED_GROUPS = {"E": "the optional three-draft reference group is not implemented"}
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "variants"
 TEMPLATE_FILES = {
@@ -47,6 +48,9 @@ TEMPLATE_FILES = {
     "A_prime": "A_prime.yaml",
     "A_prime2": "A_prime.yaml",
     "B": "B.yaml",
+    "C": "C.yaml",
+    "C_keep": "C_keep.yaml",
+    "D": "D.yaml",
 }
 
 
@@ -54,30 +58,63 @@ TEMPLATE_FILES = {
 class GroupSpec:
     key: str
     arm: str
+    source: str
     purpose: str
     rerun: bool
 
     @property
     def code_role(self) -> str:
-        return "baseline" if self.arm == "baseline" else "candidate"
+        return self.source
 
 
 GROUP_SPECS = {
-    "A": GroupSpec("A", "baseline", "baseline primary", False),
-    "A2": GroupSpec("A2", "baseline", "baseline reproducibility rerun", True),
-    "A_prime": GroupSpec("A_prime", "candidate", "candidate primary", False),
-    "A_prime2": GroupSpec("A_prime2", "candidate", "candidate reproducibility rerun", True),
-    "B": GroupSpec("B", "candidate", "candidate with polish disabled", False),
+    "A": GroupSpec("A", "baseline", "baseline", "baseline primary", False),
+    "A2": GroupSpec("A2", "baseline", "baseline", "baseline reproducibility rerun", True),
+    "A_prime": GroupSpec("A_prime", "candidate", "wp0", "WP0 baseline primary", False),
+    "A_prime2": GroupSpec(
+        "A_prime2", "candidate", "wp0", "WP0 baseline reproducibility rerun", True
+    ),
+    "B": GroupSpec("B", "candidate", "wp0", "WP0 baseline with polish disabled", False),
+    "C": GroupSpec(
+        "C", "candidate", "candidate", "reflective polish, clean batches polished", False
+    ),
+    "C_keep": GroupSpec(
+        "C_keep", "candidate", "candidate", "reflective polish, clean batches kept", False
+    ),
+    "D": GroupSpec(
+        "D", "candidate", "candidate", "reflective polish with a heterogeneous reflect route", False
+    ),
 }
+SUPPORTED_GROUPS = tuple(GROUP_SPECS)
+# The historical five-group evaluation remains the default, so existing commands
+# keep planning exactly the runs they always planned.
+DEFAULT_GROUPS = ("A", "A2", "A_prime", "A_prime2", "B")
 
 
 def require_group_supported(group: str) -> None:
-    """Fail explicitly for groups whose implementation belongs to WP2."""
+    """Fail explicitly for groups that are not implemented."""
     reason = UNSUPPORTED_GROUPS.get(group)
     if reason is not None:
         raise EvalError(f"Group {group} is unsupported: {reason}")
     if group not in GROUP_SPECS:
         raise EvalError(f"Unknown evaluation group: {group}")
+
+
+def normalize_groups(requested: Iterable[str] | None) -> tuple[str, ...]:
+    """Resolve an explicit selection; defaults preserve the five-group workflow."""
+    if requested is None:
+        return DEFAULT_GROUPS
+    if isinstance(requested, str):
+        values = [part.strip() for part in requested.split(",")]
+    else:
+        values = [str(part).strip() for part in requested]
+    values = [value for value in values if value]
+    if not values:
+        raise EvalError("At least one evaluation group must be selected")
+    for group in values:
+        require_group_supported(group)
+    selected = set(values)
+    return tuple(group for group in SUPPORTED_GROUPS if group in selected)
 
 
 def load_group_template(group: str) -> dict[str, Any]:
@@ -123,15 +160,24 @@ _REVIEW_OVERRIDE_KEYS = (
     "review_agent_max_evidence_rounds",
     "review_fix_max_rounds",
 )
+# These fields only exist in the WP2 code. They must never reach a baseline or
+# WP0 configuration, whose pinned config model rejects unknown pipeline keys.
+_WP2_PIPELINE_KEYS = ("reflective_polish", "reflect_min_severity", "reflect_clean_batches")
 
 
 def variant_config(
-    group: str, state_dir: str | os.PathLike[str], *, base: dict[str, Any] | None = None
+    group: str,
+    state_dir: str | os.PathLike[str],
+    *,
+    base: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
 ) -> dict[str, Any]:
-    """Bind a disposable state path; overlay only polish and Review settings.
+    """Bind a disposable state path and the group's treatment switches.
 
     A user configuration is preserved otherwise, so language, model routing and
     unrelated pipeline options reach both preparation and translation unchanged.
+    Control groups never inherit reflection from the user configuration, and
+    legacy code sources never receive WP2-only fields.
     """
     template = load_group_template(group)
     if base is None:
@@ -143,17 +189,53 @@ def variant_config(
         for key in _REVIEW_OVERRIDE_KEYS:
             if key in template["pipeline"]:
                 pipeline[key] = template["pipeline"][key]
+    pipeline = config.setdefault("pipeline", {})
+    for key in _WP2_PIPELINE_KEYS:
+        pipeline.pop(key, None)
+    llm = config.setdefault("llm", {})
+    routes = llm.get("routes")
+    if isinstance(routes, dict):
+        routes.pop("reflect.body", None)
+
+    if group in REFLECTIVE_GROUPS:
+        if pipeline.get("translation_mode", "standard") != "standard":
+            raise EvalError(
+                f"Group {group} requires pipeline.translation_mode=standard; "
+                "reflective polish replaces ordinary polish only in that mode"
+            )
+        pipeline["reflective_polish"] = True
+        pipeline["reflect_min_severity"] = template["pipeline"]["reflect_min_severity"]
+        pipeline["reflect_clean_batches"] = template["pipeline"]["reflect_clean_batches"]
+        if group == "D":
+            if not reflect_model:
+                raise EvalError(
+                    "Group D requires --heterogeneous-reflect-model naming a model profile "
+                    "defined by the user configuration; no model ID is invented"
+                )
+            models = llm.get("models")
+            if not isinstance(models, dict) or reflect_model not in models:
+                raise EvalError(
+                    f"Group D reflect model profile {reflect_model!r} is not defined in "
+                    "llm.models; supply a valid routing/model configuration"
+                )
+            routes = llm.setdefault("routes", {})
+            routes["reflect.body"] = {"model": reflect_model}
+    if isinstance(llm.get("routes"), dict) and not llm["routes"]:
+        llm.pop("routes")
     config.setdefault("paths", {})["state_dir"] = Path(state_dir).as_posix()
     return config
 
 
-def _routes(polish: bool) -> dict[str, Any]:
+def _routes(polish: bool, *, reflection: dict[str, Any] | None = None) -> dict[str, Any]:
+    reflect_status = "not_enabled"
+    if reflection and reflection.get("enabled"):
+        reflect_status = "unknown"
     return {
         "status": "unknown",
         "reason": "the offline adapter does not expose effective provider routes",
         "translation.body": "unknown",
         "polish.body": "unknown" if polish else "disabled",
-        "reflect.body": "unsupported",
+        "reflect.body": reflect_status,
     }
 
 
@@ -166,6 +248,96 @@ def _route_fingerprints() -> dict[str, Any]:
 
 def _template_polish(group: str) -> bool:
     return bool(load_group_template(group)["pipeline"].get("polish"))
+
+
+def reflection_plan(group: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Describe the configured reflection treatment and prove route separation.
+
+    ``C``/``C_keep`` keep the product default where ``reflect.body`` inherits
+    ``polish.body``. ``D`` must resolve an explicit heterogeneous profile; the
+    separation is proven here from resolved route identities, never by relabeling
+    an unknown or by inventing a model ID.
+    """
+    pipeline = config.get("pipeline") or {}
+    if group not in REFLECTIVE_GROUPS:
+        return {
+            "enabled": False,
+            "status": "not_enabled",
+            "clean_action": None,
+            "min_severity": None,
+            "route_separation": {"status": "not_applicable"},
+            "configured_routes": None,
+        }
+    from wenyi_core.llm.configuration import LLMConfig
+    from wenyi_core.llm.routing import resolve_routes
+
+    try:
+        resolved = resolve_routes(LLMConfig.model_validate(config.get("llm") or {}))
+    except Exception as error:
+        raise EvalError(
+            f"Group {group} reflection routing cannot be resolved: {type(error).__name__}: {error}"
+        ) from None
+    reflect = resolved["reflect.body"]
+    polish = resolved["polish.body"]
+    configured = {
+        operation: {
+            "profile": resolved[operation].profile,
+            "model": resolved[operation].model,
+            "provider": resolved[operation].provider,
+            "provider_kind": resolved[operation].provider_kind,
+            "origin": resolved[operation].origin,
+            "inference_fingerprint": resolved[operation].fingerprint,
+        }
+        for operation in ("reflect.body", "polish.body", "translation.body")
+    }
+    if group == "D":
+        if reflect.origin == "inherits polish.body":
+            raise EvalError(
+                "Group D requires an explicit reflect.body route; it must not inherit polish.body"
+            )
+        if reflect.provider == polish.provider and reflect.model == polish.model:
+            raise EvalError(
+                "Group D requires a different model family for reflect.body; the supplied "
+                "configuration resolves the same provider and model as polish.body"
+            )
+        separation = {
+            "status": "distinct",
+            "reflect_profile": reflect.profile,
+            "reflect_model": reflect.model,
+            "reflect_provider": reflect.provider,
+            "polish_profile": polish.profile,
+            "polish_model": polish.model,
+            "polish_provider": polish.provider,
+            "reflect_inference_fingerprint": reflect.fingerprint,
+            "polish_inference_fingerprint": polish.fingerprint,
+            "family_heterogeneity": "operator-declared; verified as a distinct model identity",
+        }
+    else:
+        if (
+            reflect.origin != "inherits polish.body"
+            or reflect.profile != polish.profile
+            or reflect.model != polish.model
+            or reflect.provider != polish.provider
+        ):
+            raise EvalError(f"Group {group} must let reflect.body inherit its polish.body route")
+        separation = {
+            "status": "inherited",
+            "reflect_profile": reflect.profile,
+            "reflect_model": reflect.model,
+            "reflect_provider": reflect.provider,
+            "polish_profile": polish.profile,
+            "polish_model": polish.model,
+            "polish_provider": polish.provider,
+            "reflect_inference_fingerprint": reflect.fingerprint,
+        }
+    return {
+        "enabled": True,
+        "status": "enabled",
+        "clean_action": pipeline.get("reflect_clean_batches"),
+        "min_severity": pipeline.get("reflect_min_severity"),
+        "route_separation": separation,
+        "configured_routes": configured,
+    }
 
 
 def credential_env_names(config_path: str | os.PathLike[str]) -> list[str]:
@@ -243,39 +415,57 @@ def build_group_plans(
     *,
     baseline_source: Path,
     candidate_source: Path,
+    wp0_source: Path | None = None,
     baseline_expected_sha: str = BASELINE_SHA,
+    wp0_expected_sha: str | None = None,
     candidate_expected_sha: str,
     diagnostic: bool,
     requested_groups: Iterable[str] | None = None,
     baseline_binding: dict[str, Any] | None = None,
     candidate_binding: dict[str, Any] | None = None,
+    wp0_binding: dict[str, Any] | None = None,
+    base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Resolve one explicit binding and one isolated path set per group."""
-    requested = tuple(requested_groups or SUPPORTED_GROUPS)
-    for group in requested:
-        require_group_supported(group)
-    if set(requested) != set(SUPPORTED_GROUPS):
-        raise EvalError(
-            "WP1a requires exactly the groups "
-            f"{sorted(SUPPORTED_GROUPS)}; requested {sorted(set(requested))}"
-        )
+    """Resolve explicit bindings and one isolated path set per selected group.
+
+    ``A``/``A2`` bind the upstream baseline, ``A_prime``/``A_prime2``/``B`` bind
+    the frozen WP0 checkout, and ``C``/``C_keep``/``D`` bind the current
+    workspace. Selecting a WP0 group requires its own explicit source; missing
+    bindings must never relabel the candidate working tree as the frozen WP0.
+    """
+    requested = normalize_groups(requested_groups)
+    if wp0_source is None and any(GROUP_SPECS[group].source == "wp0" for group in requested):
+        raise EvalError("An explicit frozen WP0 source is required for A_prime/A_prime2/B")
+    wp0_expected_sha = wp0_expected_sha or WP0_SHA
+    sources = {
+        "baseline": (baseline_source, baseline_expected_sha, baseline_binding),
+        "wp0": (wp0_source, wp0_expected_sha, wp0_binding),
+        "candidate": (candidate_source, candidate_expected_sha, candidate_binding),
+    }
     guard = PathGuard(root)
     plans: dict[str, dict[str, Any]] = {}
-    for key, spec in GROUP_SPECS.items():
-        source = baseline_source if spec.arm == "baseline" else candidate_source
-        expected = baseline_expected_sha if spec.arm == "baseline" else candidate_expected_sha
+    for key in requested:
+        spec = GROUP_SPECS[key]
+        source, expected, binding = sources[spec.source]
         identity = git_identity(source)
         status = _binding_status(identity, expected, diagnostic)
         polish = _template_polish(key)
-        runtime = _runtime_binding(
-            Path(identity.code_source),
-            baseline_binding if spec.arm == "baseline" else candidate_binding,
+        config = variant_config(
+            key,
+            guard.child(key, "state"),
+            base=base_config,
+            reflect_model=reflect_model,
         )
+        reflection = reflection_plan(key, config)
+        runtime = _runtime_binding(Path(identity.code_source), binding)
         plans[key] = {
             "label": spec.purpose,
             "arm": spec.arm,
+            "source_role": spec.source,
             "rerun": spec.rerun,
             "polish": polish,
+            "reflection": reflection,
             "code_source": identity.code_source,
             "git": identity.as_dict(),
             "expected_head_sha": expected,
@@ -285,7 +475,7 @@ def build_group_plans(
             "argv_prefix": runtime["argv_prefix"],
             "command": runtime["command"],
             "prompt_policy_hashes": _policy_hashes(Path(identity.code_source)),
-            "routes": _routes(polish),
+            "routes": _routes(polish, reflection=reflection),
             "route_fingerprints": _route_fingerprints(),
             "config": str(guard.child(key, "config.yaml")),
             "cwd": str(guard.child(key, "cwd")),
@@ -299,10 +489,16 @@ def build_group_plans(
             "stdout_path": str(guard.child(key, "logs", "translate.stdout.log")),
             "stderr_path": str(guard.child(key, "logs", "translate.stderr.log")),
         }
-    if plans["A"]["code_source"] == plans["A_prime"]["code_source"]:
+    distinct = {
+        "baseline": str(Path(baseline_source).resolve()),
+        "candidate": str(Path(candidate_source).resolve()),
+    }
+    if wp0_source is not None:
+        distinct["wp0"] = str(Path(wp0_source).resolve())
+    if len(set(distinct.values())) != len(distinct):
         raise EvalError(
-            "Baseline and candidate must use distinct code sources; "
-            "the current working tree must never be imported as the old baseline."
+            "Baseline, WP0 and candidate must use distinct code sources; a frozen checkout "
+            "must never be replaced by the current working tree."
         )
     return plans
 
@@ -327,19 +523,43 @@ def _policy_hashes(code_source: Path) -> dict[str, str]:
 
 
 def write_variant_configs(
-    root: Path, *, base_config: dict[str, Any] | None = None
+    root: Path,
+    *,
+    base_config: dict[str, Any] | None = None,
+    groups: Iterable[str] | None = None,
+    reflect_model: str | None = None,
 ) -> dict[str, str]:
-    """Instantiate each group with isolated paths and a shared user configuration."""
+    """Instantiate each selected group with isolated paths and shared user configuration."""
     guard = PathGuard(root)
+    selected = normalize_groups(groups)
     hashes: dict[str, str] = {}
-    for key in SUPPORTED_GROUPS:
-        config = variant_config(key, guard.child(key, "state"), base=base_config)
+    for key in selected:
+        config = variant_config(
+            key,
+            guard.child(key, "state"),
+            base=base_config,
+            reflect_model=reflect_model,
+        )
         path = guard.child(key, "config.yaml")
         path.parent.mkdir(parents=True, exist_ok=True)
         text = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
         path.write_text(text, encoding="utf-8", newline="\n")
         hashes[key] = sha256_file(path)
     return hashes
+
+
+def preparation_group(groups: Iterable[str]) -> str:
+    """Choose the producer for the shared preparation snapshot.
+
+    Prefer a frozen baseline configuration whose LLM graph matches the controls,
+    and use ``D`` only when it is the sole group because its explicit route
+    changes the persisted chapter-digest preparation contract.
+    """
+    available = set(groups)
+    for key in ("A_prime", "A_prime2", "B", "C", "C_keep", "A", "A2", "D"):
+        if key in available:
+            return key
+    raise EvalError("Cannot choose a preparation producer without a selected group")
 
 
 def build_manifest(
@@ -369,12 +589,19 @@ def build_manifest(
     source = resolve_absolute(source_path, label="book source")
     guard.ensure(source, label="book source")
     versions = software_versions()
-    adapter = plans["A_prime"]["adapter"]
+    producer = preparation_group(plans)
+    adapter = plans[producer]["adapter"]
     groups: dict[str, Any] = {}
     for key, plan in plans.items():
         entry = dict(plan)
         entry["config_sha256"] = config_hashes[key]
         groups[key] = entry
+    baseline_plan = plans.get("A") or next(
+        (plan for plan in plans.values() if plan["source_role"] == "baseline"), None
+    )
+    wp0_plan = plans.get("A_prime") or next(
+        (plan for plan in plans.values() if plan["source_role"] == "wp0"), None
+    )
     manifest = {
         "protocol_version": PROTOCOL_VERSION,
         "eval_id": eval_id,
@@ -386,8 +613,8 @@ def build_manifest(
         "comparability": {
             "status": "not_comparable" if diagnostic else "pending",
             "reason": (
-                "Offline adapter replaces the external model boundary; this run validates "
-                "the harness and never supports quality or cost conclusions."
+                "Diagnostic adapter or dirty/unfrozen code replaces a comparable model boundary; "
+                "this run validates the harness and never supports quality or cost conclusions."
                 if diagnostic
                 else None
             ),
@@ -396,8 +623,10 @@ def build_manifest(
         "runs_dir": str(runs_dir),
         "repo": {
             "root": str(repo_root),
-            "baseline_sha": plans["A"]["expected_head_sha"],
+            "baseline_sha": baseline_plan["expected_head_sha"] if baseline_plan else BASELINE_SHA,
             "baseline_ref": BASELINE_REF,
+            "wp0_sha": wp0_plan["expected_head_sha"] if wp0_plan else WP0_SHA,
+            "wp0_ref": WP0_REF,
         },
         "source": {
             "path": str(source),
@@ -416,7 +645,7 @@ def build_manifest(
         "groups": groups,
         "preparation": {
             "entry": preparation_entry,
-            "producer_group": "A_prime",
+            "producer_group": producer,
             "snapshot": str(guard.child("_prepared")),
             "cost": "unknown",
             "cost_reason": (
@@ -433,8 +662,8 @@ def build_manifest(
                 else "selected product factory (no evaluation monkeypatch)"
             ),
             "preset": "configured" if adapter == "provider" else "fake",
-            "routes": plans["A_prime"]["routes"],
-            "route_fingerprints": plans["A_prime"]["route_fingerprints"],
+            "routes": plans[producer]["routes"],
+            "route_fingerprints": plans[producer]["route_fingerprints"],
             "model_params": {
                 "temperature": "provider default",
                 "max_output_tokens": "provider default",
@@ -454,10 +683,12 @@ def validate_manifest(manifest: dict[str, Any], *, repo_root: Path) -> None:
     """Reject unsafe paths, duplicate ownership and unresolved group bindings."""
     root = resolve_absolute(manifest.get("root", ""), label="manifest root")
     guard = PathGuard(root)
-    required_groups = set(SUPPORTED_GROUPS)
     groups = manifest.get("groups")
-    if not isinstance(groups, dict) or set(groups) != required_groups:
-        raise EvalError(f"Manifest must contain exactly groups {sorted(required_groups)}")
+    if not isinstance(groups, dict) or not groups:
+        raise EvalError("Manifest must contain at least one evaluation group")
+    unknown = set(groups) - set(SUPPORTED_GROUPS)
+    if unknown:
+        raise EvalError(f"Manifest contains unsupported groups: {sorted(unknown)}")
     forbidden = [
         repo_root / "state",
         repo_root / "output",
@@ -505,12 +736,35 @@ def validate_manifest(manifest: dict[str, Any], *, repo_root: Path) -> None:
             raise EvalError(f"Group {key} has no executable binding")
         if not isinstance(group.get("argv_prefix"), list):
             raise EvalError(f"Group {key} has no argv binding")
-        if group.get("arm") == "baseline" and actual != manifest["repo"]["baseline_sha"]:
+        if group.get("source_role") not in SOURCE_ROLES:
+            raise EvalError(f"Group {key} has no explicit source role")
+        if group.get("source_role") == "baseline" and actual != manifest["repo"]["baseline_sha"]:
             raise EvalError(f"Baseline group {key} is not at {manifest['repo']['baseline_sha']}")
+        if group.get("source_role") == "wp0" and actual != manifest["repo"]["wp0_sha"]:
+            raise EvalError(f"WP0 group {key} is not at {manifest['repo']['wp0_sha']}")
         if not isinstance(group.get("polish"), bool):
             raise EvalError(f"Group {key} must declare whether polish is enabled")
         if key == "B" and group["polish"]:
             raise EvalError("Group B must have polish disabled")
+        reflection = group.get("reflection")
+        if not isinstance(reflection, dict) or not isinstance(reflection.get("enabled"), bool):
+            raise EvalError(f"Group {key} must declare whether reflection is enabled")
+        if key in REFLECTIVE_GROUPS:
+            if not group["polish"] or not reflection["enabled"]:
+                raise EvalError(f"Group {key} must enable reflection with polish")
+            if reflection.get("clean_action") not in {"polish", "keep"}:
+                raise EvalError(f"Group {key} must declare its clean-batch strategy")
+            if reflection.get("min_severity") not in {"major", "critical"}:
+                raise EvalError(f"Group {key} must declare its critique severity threshold")
+            separation = (reflection.get("route_separation") or {}).get("status")
+            expected_separation = "distinct" if key == "D" else "inherited"
+            if separation != expected_separation:
+                raise EvalError(
+                    f"Group {key} reflection route separation is {separation!r}, "
+                    f"expected {expected_separation!r}"
+                )
+        elif reflection["enabled"]:
+            raise EvalError(f"Control group {key} must not enable reflective polish")
         for field in ("routes", "route_fingerprints"):
             if not isinstance(group.get(field), dict):
                 raise EvalError(f"Group {key} lacks explicit {field}")
@@ -518,12 +772,16 @@ def validate_manifest(manifest: dict[str, Any], *, repo_root: Path) -> None:
             raise EvalError(f"Group {key} routes status is unresolved")
         if group["route_fingerprints"].get("status") not in {"known", "unknown"}:
             raise EvalError(f"Group {key} route fingerprint status is unresolved")
+        if key == "B" and group["routes"].get("polish.body") not in {"disabled", "unknown"}:
+            raise EvalError("Group B must record polish as disabled or unknown")
     source = manifest.get("source", {})
     source_path = guard.ensure(source.get("path", ""), label="source.path")
     if source.get("sha256") != sha256_file(source_path):
         raise EvalError("Manifest source hash does not match the file on disk")
     preparation = manifest.get("preparation", {})
     guard.ensure(preparation.get("snapshot", ""), label="preparation.snapshot")
+    if preparation.get("producer_group") not in groups:
+        raise EvalError("Preparation producer must be one of the selected groups")
     if manifest.get("diagnostic") and not manifest.get("comparability", {}).get("reason"):
         raise EvalError("Diagnostic manifests must state why results are not comparable")
     if manifest.get("prices", {}).get("status") not in {"known", "unknown", "partial"}:
@@ -532,6 +790,23 @@ def validate_manifest(manifest: dict[str, Any], *, repo_root: Path) -> None:
     for field in ("routes", "route_fingerprints"):
         if not isinstance(llm.get(field), dict):
             raise EvalError(f"Manifest llm metadata lacks explicit {field}")
+
+    # Control groups must carry no WP2-only fields into legacy code.
+    for key, group in groups.items():
+        config_path = Path(group["config"])
+        if not config_path.is_file():
+            continue
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        pipeline = data.get("pipeline") or {}
+        present = [name for name in _WP2_PIPELINE_KEYS if name in pipeline]
+        if key not in REFLECTIVE_GROUPS and present:
+            raise EvalError(
+                f"Control group {key} configuration contains WP2-only fields: {present}"
+            )
+        if key not in REFLECTIVE_GROUPS and (data.get("llm") or {}).get("routes", {}).get(
+            "reflect.body"
+        ):
+            raise EvalError(f"Control group {key} configuration routes reflect.body")
 
 
 def require_frozen_bindings(manifest: dict[str, Any]) -> None:

@@ -132,3 +132,19 @@ def test_child_command_uses_the_declared_executable_and_argv() -> None:
         "status",
         "book.md",
     ]
+
+
+def test_terminal_validation_accepts_a_selected_subset_and_isolated_preparation(
+    tmp_path: Path,
+) -> None:
+    store = TerminalStore(tmp_path / "eval")
+    store.write(_terminal("preparation", "prepare"))
+    store.write(_terminal("preparation", "prepare.C"))
+    for group in ("A", "C"):
+        for stage in GROUP_STAGES:
+            store.write(_terminal(group, stage))
+
+    rows = store.validate_complete(groups=("A", "C"), isolated_preparations=("C",))
+
+    assert len(rows) == 2 + 2 * len(GROUP_STAGES)
+    assert ("preparation", "prepare.C") in rows

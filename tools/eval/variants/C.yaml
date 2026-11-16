@@ -1,5 +1,6 @@
-# Group C template for WP2 reflective polish. It is intentionally not runnable
-# until the reflective-polish implementation exists; requesting group C fails.
+# Group C: WP2 reflective polish with clean batches polished. The harness
+# overlays pipeline switches and paths, strips any explicit reflect.body route so
+# it inherits polish.body, and requires pipeline.polish and standard mode.
 language:
   source: en
   target: zh

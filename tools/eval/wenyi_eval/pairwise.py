@@ -11,16 +11,21 @@ import csv
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .common import EvalError, PathGuard, append_jsonl, read_json, utc_now, write_json_atomic
-from .manifest import SUPPORTED_GROUPS
 
 DEFAULT_COMPARISONS = (
     {"id": "A_vs_Aprime", "baseline": "A", "candidate": "A_prime"},
     {"id": "A_vs_B", "baseline": "A", "candidate": "B"},
     {"id": "Aprime_vs_B", "baseline": "A_prime", "candidate": "B"},
 )
+REFLECTIVE_COMPARISONS = (
+    {"id": "Aprime_vs_C", "baseline": "A_prime", "candidate": "C"},
+    {"id": "Aprime_vs_C_keep", "baseline": "A_prime", "candidate": "C_keep"},
+    {"id": "Aprime_vs_D", "baseline": "A_prime", "candidate": "D"},
+)
+ALL_COMPARISONS = DEFAULT_COMPARISONS + REFLECTIVE_COMPARISONS
 RATINGS_COLUMNS = (
     "pair_id",
     "source_text",
@@ -58,12 +63,28 @@ class RatingError(EvalError):
 
 def _target_index(extraction: dict[str, Any]) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
-    for group in SUPPORTED_GROUPS:
+    for group in extraction.get("groups", {}):
         data = extraction["groups"].get(group, {})
         for chapter in data.get("chapters", []):
             for segment in chapter.get("segments", []):
                 index[f"{group}|{segment['id']}"] = segment
     return index
+
+
+def comparisons_for(groups: Iterable[str]) -> tuple[dict[str, str], ...]:
+    """Select preregistered comparisons whose two groups are both present."""
+    available = set(groups)
+    return tuple(
+        comparison
+        for comparison in ALL_COMPARISONS
+        if comparison["baseline"] in available and comparison["candidate"] in available
+    )
+
+
+def _pair_id(seed: int, comparison_id: str, segment_id: str) -> str:
+    """Return an opaque identifier so blind packets never carry variant labels."""
+    digest = hashlib.sha256(f"{seed}:{comparison_id}:{segment_id}".encode("utf-8")).hexdigest()
+    return f"pair-{digest[:20]}"
 
 
 def _side_hash(text: str) -> str:
@@ -92,14 +113,16 @@ def export_pairwise(
     targets = _target_index(extraction)
     seed = int(manifest["llm"]["seed"]) + 1
     sections = {**{row["id"]: row["source_text"] for row in strata}}
+    groups = manifest.get("groups") or extraction.get("groups") or {}
+    comparisons = comparisons_for(groups)
     pairs: list[dict[str, Any]] = []
     keys: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     for row in strata:
-        for comparison in DEFAULT_COMPARISONS:
+        for comparison in comparisons:
             baseline = targets.get(f"{comparison['baseline']}|{row['id']}")
             candidate = targets.get(f"{comparison['candidate']}|{row['id']}")
-            pair_id = f"{comparison['id']}:{row['id']}"
+            pair_id = _pair_id(seed, comparison["id"], row["id"])
             if (
                 not baseline
                 or not candidate
@@ -109,6 +132,7 @@ def export_pairwise(
                 missing.append(
                     {
                         "pair_id": pair_id,
+                        "comparison": comparison["id"],
                         "baseline_status": baseline.get("status") if baseline else "missing",
                         "candidate_status": candidate.get("status") if candidate else "missing",
                     }
@@ -123,6 +147,7 @@ def export_pairwise(
                 missing.append(
                     {
                         "pair_id": pair_id,
+                        "comparison": comparison["id"],
                         "baseline_status": "invalid",
                         "candidate_status": "invalid",
                     }
@@ -169,7 +194,7 @@ def export_pairwise(
         "created_at": utc_now(),
         "seed": seed,
         "source_sha256": manifest["source"]["sha256"],
-        "comparisons": list(DEFAULT_COMPARISONS),
+        "comparisons": list(comparisons),
         "sampled_segments": len(strata),
         "expected_pairs": len(pairs),
         "missing_pairs": len(missing),
@@ -179,6 +204,7 @@ def export_pairwise(
         "denominator": len(pairs),
         "human_ratings_received": 0,
         "blinding": "anonymous_side_labels_not_double_blind",
+        "blind_packet_labels": "opaque_pair_ids_absent_from_key",
         "reason_unrated": "No human ratings have been imported; all pairwise cells remain missing.",
     }
     write_json_atomic(directory / "pairwise_preregistration.json", preregistration)

@@ -103,8 +103,6 @@ def test_export_preserves_missing_pairs_instead_of_dropping_them(tmp_path: Path)
     assert preregistration["expected_pairs"] == 4
     assert preregistration["missing_pairs"] == 2
     assert preregistration["denominator"] == 4
-    missing_id = "A_vs_B:seg:1"
-    assert missing_id not in key
     missing = [
         json.loads(line)
         for line in (root / "samples" / "pairwise_missing.jsonl")
@@ -112,8 +110,9 @@ def test_export_preserves_missing_pairs_instead_of_dropping_them(tmp_path: Path)
         .splitlines()
         if line.strip()
     ]
-    assert {row["pair_id"] for row in missing} == {"A_vs_B:seg:1", "Aprime_vs_B:seg:1"}
+    assert {row["comparison"] for row in missing} == {"A_vs_B", "Aprime_vs_B"}
     assert all(row["candidate_status"] == "missing" for row in missing)
+    assert all(row["pair_id"] not in key for row in missing)
 
 
 def test_blank_ratings_stay_missing_and_keep_the_denominator(tmp_path: Path) -> None:
@@ -181,7 +180,7 @@ def test_valid_ratings_are_normalized_without_imputing_blanks(tmp_path: Path) ->
         [{"pair_id": "unknown", "preference": "left", "omission": "", "addition": "", "notes": ""}],
         [
             {
-                "pair_id": "A_vs_Aprime:seg:0",
+                "pair_id": "PAIR:0",
                 "preference": "maybe",
                 "omission": "",
                 "addition": "",
@@ -190,7 +189,7 @@ def test_valid_ratings_are_normalized_without_imputing_blanks(tmp_path: Path) ->
         ],
         [
             {
-                "pair_id": "A_vs_Aprime:seg:0",
+                "pair_id": "PAIR:0",
                 "preference": "left",
                 "omission": "sometimes",
                 "addition": "",
@@ -199,14 +198,14 @@ def test_valid_ratings_are_normalized_without_imputing_blanks(tmp_path: Path) ->
         ],
         [
             {
-                "pair_id": "A_vs_Aprime:seg:0",
+                "pair_id": "PAIR:0",
                 "preference": "left",
                 "omission": "",
                 "addition": "",
                 "notes": "",
             },
             {
-                "pair_id": "A_vs_Aprime:seg:0",
+                "pair_id": "PAIR:0",
                 "preference": "right",
                 "omission": "",
                 "addition": "",
@@ -221,7 +220,12 @@ def test_import_rejects_unknown_invalid_or_duplicate_ratings(
     root = tmp_path / "eval"
     _strata(root)
     export_pairwise(root=root, manifest=_manifest(), extraction=_extraction())
-    _write_import(root / "samples" / "bad.csv", rows)
+    pair_ids = [row["pair_id"] for row in _read_csv(root / "samples" / "pairwise.csv")]
+    resolved = [
+        {**row, "pair_id": pair_ids[0] if row["pair_id"] == "PAIR:0" else row["pair_id"]}
+        for row in rows
+    ]
+    _write_import(root / "samples" / "bad.csv", resolved)
 
     with pytest.raises(RatingError):
         import_pairwise_ratings(root, root / "samples" / "bad.csv")
@@ -240,3 +244,51 @@ def test_import_rejects_a_denominator_that_disagrees_with_exported_pairs(
 
     with pytest.raises(RatingError, match="denominator"):
         import_pairwise_ratings(root, root / "samples" / "pairwise.csv")
+
+
+def test_reflective_comparisons_use_opaque_blind_ids(tmp_path: Path) -> None:
+    root = tmp_path / "eval"
+    _strata(root)
+    extraction = {
+        "groups": {
+            "A_prime": {
+                "chapters": [
+                    {
+                        "segments": [
+                            {"id": "seg:0", "target": "prime-zero", "status": "translated"},
+                            {"id": "seg:1", "target": "prime-one", "status": "translated"},
+                        ]
+                    }
+                ]
+            },
+            "C": {
+                "chapters": [
+                    {
+                        "segments": [
+                            {"id": "seg:0", "target": "c-zero", "status": "translated"},
+                            {"id": "seg:1", "target": "c-one", "status": "translated"},
+                        ]
+                    }
+                ]
+            },
+        }
+    }
+    manifest = {
+        "source": {"sha256": "a" * 64},
+        "llm": {"seed": 5},
+        "groups": {"A_prime": {}, "C": {}},
+    }
+
+    preregistration = export_pairwise(root=root, manifest=manifest, extraction=extraction)
+
+    assert [item["id"] for item in preregistration["comparisons"]] == ["Aprime_vs_C"]
+    ratings = _read_csv(root / "samples" / "pairwise.csv")
+    key = _read_csv(root / "samples" / "pairwise_key.csv")
+    assert len(ratings) == 2
+    assert all(row["pair_id"].startswith("pair-") for row in ratings)
+    assert "Aprime_vs_C" not in json.dumps(ratings)
+    assert {row["comparison"] for row in key} == {"Aprime_vs_C"}
+    assert {row["left_group"] for row in key} | {row["right_group"] for row in key} == {
+        "A_prime",
+        "C",
+    }

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from .common import PathGuard, read_json, utc_now, write_json_atomic
-from .manifest import SUPPORTED_GROUPS
 
 
 def _value(value: Any) -> str:
@@ -26,14 +25,21 @@ def _load_optional(path: Path) -> dict[str, Any] | None:
 
 
 def _execution_check(
-    execution: dict[str, Any], extraction: dict[str, Any]
+    execution: dict[str, Any], extraction: dict[str, Any], groups: list[str]
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     terminals = execution.get("terminals", {})
     preparation = terminals.get("preparation.prepare", {})
     if preparation.get("status") != "succeeded":
         reasons.append("preparation did not succeed")
-    for group in SUPPORTED_GROUPS:
+    for group, record in (execution.get("isolated_preparation") or {}).items():
+        path = record.get("terminal_path")
+        status = None
+        if isinstance(path, str) and Path(path).is_file():
+            status = (read_json(path) or {}).get("status")
+        if status != "succeeded":
+            reasons.append(f"isolated preparation for {group} is {status or 'missing'}")
+    for group in groups:
         for stage in ("translate", "status", "inspect"):
             terminal = terminals.get(f"{group}.{stage}", {})
             if terminal.get("status") != "succeeded":
@@ -58,6 +64,22 @@ def _execution_check(
         review = extraction["groups"].get(group, {}).get("review", {})
         if review.get("status") != "available":
             reasons.append(f"{group} review result is {review.get('status', 'missing')}")
+        reflection = extraction["groups"].get(group, {}).get("reflection") or {}
+        if reflection.get("enabled"):
+            segments = reflection.get("segments") or {}
+            uncovered = sum(
+                segments.get(status, 0) for status in ("missing", "stale", "invalid", "ambiguous")
+            )
+            if uncovered:
+                reasons.append(
+                    f"{group} has {uncovered} segments without a current reflection artifact"
+                )
+            if (
+                reflection.get("status") == "current"
+                and segments.get("expected", 0) > 0
+                and not reflection.get("adoption_counts")
+            ):
+                reasons.append(f"{group} reflection evidence has no adoption records")
     if not execution.get("source_unchanged"):
         reasons.append("fixture source changed")
     if not execution.get("preparation_unchanged"):
@@ -148,7 +170,7 @@ def _group_rows(
     rows = []
     terminals = execution.get("terminals", {})
     compatibility = (execution.get("preparation_compatibility") or {}).get("groups", {})
-    for group in SUPPORTED_GROUPS:
+    for group in manifest["groups"]:
         plan = manifest["groups"][group]
         extracted = extraction["groups"].get(group, {})
         coverage = extracted.get("coverage") or {}
@@ -157,6 +179,8 @@ def _group_rows(
         terminal = terminals.get(f"{group}.translate", {})
         validation = terminal.get("receipt_validation") or {}
         review = extracted.get("review") or {}
+        reflection = extracted.get("reflection") or {}
+        reflection_segments = reflection.get("segments") or {}
         expected = coverage.get("expected")
         missing = coverage.get("missing")
         stale = coverage.get("stale")
@@ -171,6 +195,7 @@ def _group_rows(
             {
                 "group": group,
                 "arm": plan["arm"],
+                "source_role": plan.get("source_role"),
                 "code_sha": plan["git"]["head_sha"],
                 "binding_status": plan["binding_status"],
                 "preparation_status": (compatibility.get(group) or {}).get("status"),
@@ -192,6 +217,25 @@ def _group_rows(
                 "failed_rate": _rate(failed, expected),
                 "review_status": review.get("status"),
                 "review_issues": review.get("issues"),
+                "reflection_status": reflection.get("status", "not_enabled"),
+                "reflection_enabled": bool(reflection.get("enabled")),
+                "reflection_current_batches": (reflection.get("artifacts") or {}).get("current"),
+                "reflection_stale_batches": (reflection.get("artifacts") or {}).get("stale"),
+                "reflection_invalid_batches": (reflection.get("artifacts") or {}).get("invalid"),
+                "reflection_ambiguous_batches": (reflection.get("artifacts") or {}).get(
+                    "ambiguous"
+                ),
+                "reflection_current_segments": reflection_segments.get("current"),
+                "reflection_uncovered_segments": sum(
+                    reflection_segments.get(status, 0)
+                    for status in ("missing", "stale", "invalid", "ambiguous")
+                ),
+                "reflection_write_failed_events": (reflection.get("artifacts") or {}).get(
+                    "write_failed_events"
+                ),
+                "reflection_adoption": reflection.get("adoption_counts"),
+                "reflection_critique": reflection.get("critique_counts"),
+                "reflection_failure": reflection.get("failure_counts"),
                 "calls": tokens.get("calls"),
                 "prompt_tokens": tokens.get("prompt_tokens"),
                 "completion_tokens": tokens.get("completion_tokens"),
@@ -220,7 +264,8 @@ def write_report(
     selection = _load_optional(root / "samples" / "selection.json")
     preregistration = _load_optional(root / "samples" / "pairwise_preregistration.json")
     imported = _load_optional(root / "samples" / "pairwise_import.json")
-    execution_ok, execution_reasons = _execution_check(execution, extraction)
+    groups = list(manifest["groups"])
+    execution_ok, execution_reasons = _execution_check(execution, extraction, groups)
     if not execution_ok:
         conclusion = "failed"
         decision_reason = "Execution or coverage checks failed: " + "; ".join(execution_reasons)
@@ -255,16 +300,22 @@ def write_report(
         "execution_ok": execution_ok,
         "execution_reasons": execution_reasons,
         "preparation_compatibility": execution.get("preparation_compatibility"),
+        "isolated_preparation": {
+            group: {
+                "snapshot": record.get("snapshot_dir"),
+                "terminal": record.get("terminal_path"),
+                "cost": record.get("cost"),
+                "usage": record.get("usage"),
+            }
+            for group, record in (execution.get("isolated_preparation") or {}).items()
+        },
         "groups": rows,
         "coverage": {
-            group: extraction["groups"].get(group, {}).get("coverage") for group in SUPPORTED_GROUPS
+            group: extraction["groups"].get(group, {}).get("coverage") for group in groups
         },
-        "review": {
-            group: extraction["groups"].get(group, {}).get("review") for group in SUPPORTED_GROUPS
-        },
+        "review": {group: extraction["groups"].get(group, {}).get("review") for group in groups},
         "reflection": {
-            group: extraction["groups"].get(group, {}).get("reflection")
-            for group in SUPPORTED_GROUPS
+            group: extraction["groups"].get(group, {}).get("reflection") for group in groups
         },
         "cost": {
             "price_status": cost["price_status"],
@@ -291,6 +342,7 @@ def _write_group_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "group",
         "arm",
+        "source_role",
         "code_sha",
         "binding_status",
         "preparation_status",
@@ -312,6 +364,18 @@ def _write_group_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "failed_rate",
         "review_status",
         "review_issues",
+        "reflection_status",
+        "reflection_enabled",
+        "reflection_current_batches",
+        "reflection_stale_batches",
+        "reflection_invalid_batches",
+        "reflection_ambiguous_batches",
+        "reflection_current_segments",
+        "reflection_uncovered_segments",
+        "reflection_write_failed_events",
+        "reflection_adoption",
+        "reflection_critique",
+        "reflection_failure",
         "calls",
         "prompt_tokens",
         "completion_tokens",
@@ -535,6 +599,19 @@ def _markdown(
             "",
         ]
     )
+    for key in sorted(cost["groups"]):
+        if not key.startswith("preparation:") or key == "preparation":
+            continue
+        isolated = cost["groups"][key]
+        tokens = isolated.get("tokens") or {}
+        lines.append(
+            f"Isolated preparation `{key.split(':', 1)[1]}`: calls "
+            f"{_value(tokens.get('calls'))}; cost "
+            f"{_value((isolated.get('cost') or {}).get('amount'))} "
+            f"({_value((isolated.get('cost') or {}).get('status'))}); charged separately."
+        )
+    if any(key.startswith("preparation:") for key in cost["groups"]):
+        lines.append("")
     lines.extend(
         _table(
             ["Group", "Review status", "Issues", "Reviewed segments", "Reflection"],
@@ -544,7 +621,43 @@ def _markdown(
                     row["review_status"],
                     row["review_issues"],
                     (report["review"].get(row["group"]) or {}).get("reviewed_segments"),
-                    (report["reflection"].get(row["group"]) or {}).get("status"),
+                    row["reflection_status"],
+                ]
+                for row in report["groups"]
+            ],
+        )
+    )
+    lines.extend(["", "### Reflection evidence", ""])
+    lines.extend(
+        _table(
+            [
+                "Group",
+                "Status",
+                "Current batches",
+                "Stale",
+                "Invalid",
+                "Ambiguous",
+                "Current segments",
+                "Uncovered",
+                "Write failed",
+                "Adoption",
+                "Critique",
+                "Failure",
+            ],
+            [
+                [
+                    row["group"],
+                    row["reflection_status"],
+                    row["reflection_current_batches"],
+                    row["reflection_stale_batches"],
+                    row["reflection_invalid_batches"],
+                    row["reflection_ambiguous_batches"],
+                    row["reflection_current_segments"],
+                    row["reflection_uncovered_segments"],
+                    row["reflection_write_failed_events"],
+                    json.dumps(row["reflection_adoption"], sort_keys=True),
+                    json.dumps(row["reflection_critique"], sort_keys=True),
+                    json.dumps(row["reflection_failure"], sort_keys=True),
                 ]
                 for row in report["groups"]
             ],
@@ -553,9 +666,25 @@ def _markdown(
     lines.extend(
         [
             "",
-            "Reflection is reported as unsupported/unavailable with WP2 artifacts absent; "
-            "it is never treated as a clean metric.",
+            "A `current` artifact only means the record applies to the current post-alignment "
+            "text; it is never a clean quality verdict. Missing, stale, invalid or ambiguous "
+            "artifacts stay in the segment denominator and are never counted as adoption. "
+            "`skipped_no_turn` remains a critique outcome, not a clean batch.",
             "",
+        ]
+    )
+    isolated = report.get("isolated_preparation") or {}
+    if isolated:
+        lines.extend(["### Isolated preparation", ""])
+        for group, record in sorted(isolated.items()):
+            lines.append(
+                f"- `{group}`: snapshot `{record.get('snapshot')}`; terminal "
+                f"`{record.get('terminal')}`; cost "
+                f"{(record.get('cost') or {}).get('status')} (charged separately)."
+            )
+        lines.append("")
+    lines.extend(
+        [
             "## Human evaluation",
             "",
             f"- Suggested stratified rows: {_value((selection or {}).get('selected'))} "
@@ -565,8 +694,8 @@ def _markdown(
             f"rated rows: {_value((imported or {}).get('rated_rows'))}.",
             "- Suggested strata and pairwise rows are not counted as human evidence. "
             "Missing ratings remain missing.",
-            "- Pairwise ratings use anonymous side labels and a separate key; this is not "
-            "described as double blind.",
+            "- Pairwise ratings use anonymous side labels and opaque pair ids with a separate key; "
+            "this is not described as double blind.",
             "",
             "## Limitations and unknowns",
             "",

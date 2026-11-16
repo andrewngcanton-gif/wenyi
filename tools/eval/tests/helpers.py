@@ -10,7 +10,7 @@ from wenyi_core.models.document import Chapter, Segment
 from wenyi_core.storage.file import FileStorage
 
 from wenyi_eval.common import sha256_file
-from wenyi_eval.manifest import BASELINE_SHA, SUPPORTED_GROUPS
+from wenyi_eval.manifest import BASELINE_SHA, DEFAULT_GROUPS
 
 CANDIDATE_SHA = "b" * 40
 
@@ -78,6 +78,7 @@ def minimal_manifest(
     prices: dict[str, Any] | None = None,
     candidate_sha: str = CANDIDATE_SHA,
     candidate_binding: str = "clean",
+    groups: tuple[str, ...] = DEFAULT_GROUPS,
 ) -> dict[str, Any]:
     """Build a manifest that satisfies validate_manifest without running the CLI."""
     root = root.resolve()
@@ -85,16 +86,19 @@ def minimal_manifest(
         source = root / "source" / "book.en.md"
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("Synthetic source for tests.\n", encoding="utf-8", newline="\n")
-    groups: dict[str, Any] = {}
-    for key in SUPPORTED_GROUPS:
+    entries: dict[str, Any] = {}
+    for key in groups:
         baseline = key in {"A", "A2"}
+        wp0 = key in {"A_prime", "A_prime2", "B"}
         expected = BASELINE_SHA if baseline else candidate_sha
         if not baseline and candidate_binding == "unfrozen":
             expected = "unfrozen"
         group_root = root / key
-        groups[key] = {
+        reflective = key in {"C", "C_keep", "D"}
+        entries[key] = {
             "label": key,
             "arm": "baseline" if baseline else "candidate",
+            "source_role": "baseline" if baseline else ("wp0" if wp0 else "candidate"),
             "rerun": key.endswith("2"),
             "code_source": str(root / "code" / key),
             "git": {"head_sha": BASELINE_SHA if baseline else candidate_sha},
@@ -105,12 +109,24 @@ def minimal_manifest(
             "argv_prefix": ["-m", "wenyi_cli"],
             "command": ["python", "-m", "wenyi_cli"],
             "polish": key != "B",
+            "reflection": {
+                "enabled": reflective,
+                "status": "enabled" if reflective else "not_enabled",
+                "clean_action": ("keep" if key == "C_keep" else "polish") if reflective else None,
+                "min_severity": "major" if reflective else None,
+                "route_separation": {
+                    "status": "distinct"
+                    if key == "D"
+                    else ("inherited" if reflective else "not_applicable")
+                },
+                "configured_routes": None,
+            },
             "prompt_policy_hashes": {"tasks": "test", "rules": "test", "languages": "test"},
             "routes": {
                 "status": "known",
                 "translation.body": "test-route",
                 "polish.body": "disabled" if key == "B" else "test-route",
-                "reflect.body": "unsupported",
+                "reflect.body": "unknown" if reflective else "not_enabled",
             },
             "route_fingerprints": {"status": "known", "fingerprint": "test"},
             "config": str(group_root / "config.yaml"),
@@ -138,7 +154,11 @@ def minimal_manifest(
         },
         "root": str(root),
         "runs_dir": str(root.parent),
-        "repo": {"root": str(root / "repo"), "baseline_sha": BASELINE_SHA},
+        "repo": {
+            "root": str(root / "repo"),
+            "baseline_sha": BASELINE_SHA,
+            "wp0_sha": candidate_sha,
+        },
         "source": {
             "path": str(source),
             "sha256": sha256_file(source),
@@ -153,10 +173,10 @@ def minimal_manifest(
             "source_language": "en",
             "target_language": "zh",
         },
-        "groups": groups,
+        "groups": entries,
         "preparation": {
             "entry": "test",
-            "producer_group": "A_prime",
+            "producer_group": "A_prime" if "A_prime" in groups else groups[0],
             "snapshot": str(root / "_prepared"),
         },
         "llm": {

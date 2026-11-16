@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from .common import EvalError, PathGuard, read_json, utc_now, write_json_atomic
-from .manifest import SUPPORTED_GROUPS
 
 COST_PROTOCOL = 1
 _TOKEN_FIELDS = (
@@ -388,7 +387,26 @@ def build_cost_summary(
     if isinstance(terminal, str) and Path(terminal).is_file():
         prep_summary["wall_seconds"] = read_json(terminal).get("duration_seconds")
     groups["preparation"] = prep_summary
-    for group in SUPPORTED_GROUPS:
+    for isolated_group, isolated in (execution.get("isolated_preparation") or {}).items():
+        isolated_status = (
+            "synthetic" if isolated.get("adapter", "offline") == "offline" else "provider"
+        )
+        isolated_rows, isolated_summary = _usage_rows(
+            scope=f"preparation:{isolated_group}",
+            group=None,
+            usage=isolated.get("usage"),
+            prices=prices,
+            usage_status=isolated_status,
+        )
+        isolated_summary["wall_seconds"] = None
+        terminal = isolated.get("terminal_path")
+        if isinstance(terminal, str) and Path(terminal).is_file():
+            isolated_summary["wall_seconds"] = read_json(terminal).get("duration_seconds")
+        isolated_summary["isolated_preparation"] = True
+        isolated_summary["reason"] = "preparation contract differed from the shared snapshot"
+        rows.extend(isolated_rows)
+        groups[f"preparation:{isolated_group}"] = isolated_summary
+    for group in manifest["groups"]:
         extracted = extraction["groups"].get(group, {})
         usage = extracted.get("usage")
         adapter = (manifest.get("groups", {}).get(group) or {}).get("adapter", "offline")

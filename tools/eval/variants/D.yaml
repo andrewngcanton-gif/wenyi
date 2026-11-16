@@ -1,6 +1,7 @@
-# Group D template for WP2 reflective polish with a heterogeneous reflect.body
-# route. The routing form depends on WP2 configuration, so this template cannot
-# be executed and requesting group D fails explicitly.
+# Group D: group C plus an explicit heterogeneous reflect.body route. Supply
+# --heterogeneous-reflect-model naming a profile already defined in llm.models;
+# the harness injects that route and proves the resolved reflect/polish model
+# identities differ. No model ID or credential is invented here.
 language:
   source: en
   target: zh

@@ -1,4 +1,4 @@
-"""Isolated WP1a evaluation harness for Wenyi variants.
+"""Isolated evaluation harness for Wenyi variants.
 
 The package is intentionally independent from the repository workspace: it owns
 its uv environment and lock, reads product state only through public storage

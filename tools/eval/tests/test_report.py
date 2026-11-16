@@ -152,7 +152,10 @@ def test_diagnostic_report_is_inconclusive_and_publishes_all_summaries(tmp_path:
     assert "**Conclusion: inconclusive**" in markdown
     assert "Missing and stale keys are never silently dropped." in markdown
     assert "Unknown prices are reported as unknown, never zero." in markdown
-    assert "Reflection is reported as unsupported/unavailable" in markdown
+    assert "A `current` artifact only means the record applies to the current post-alignment" in (
+        markdown
+    )
+    assert "it is never a clean quality verdict" in markdown
     assert "not described as double blind" in markdown
     assert "unknown" in markdown
 
@@ -209,3 +212,85 @@ def test_missing_human_ratings_or_decision_rule_stay_inconclusive(tmp_path: Path
     report = _report(root, manifest)
     assert report["conclusion"] == "inconclusive"
     assert "No preregistered statistical decision rule" in report["decision_reason"]
+
+
+def test_missing_or_stale_reflection_is_reported_and_never_clean(tmp_path: Path) -> None:
+    root = tmp_path / "eval"
+    manifest = minimal_manifest(root, diagnostic=True, groups=("C",))
+    extraction = {
+        "groups": {
+            "C": {
+                "status": "ok",
+                "coverage": {
+                    "expected": 2,
+                    "translated": 2,
+                    "empty": 0,
+                    "missing": 0,
+                    "stale": 0,
+                    "error": 0,
+                },
+                "review": {"status": "available", "issues": 0, "reviewed_segments": 2},
+                "reflection": {
+                    "enabled": True,
+                    "status": "stale",
+                    "artifacts": {
+                        "current": 0,
+                        "stale": 1,
+                        "invalid": 0,
+                        "ambiguous": 0,
+                        "write_failed_events": 0,
+                    },
+                    "segments": {
+                        "expected": 2,
+                        "current": 0,
+                        "missing": 1,
+                        "stale": 1,
+                        "invalid": 0,
+                        "ambiguous": 0,
+                        "not_enabled": 0,
+                    },
+                    "adoption_counts": {},
+                    "critique_counts": {},
+                    "failure_counts": {},
+                },
+            }
+        }
+    }
+    terminals = {"preparation.prepare": {"status": "succeeded"}}
+    for stage in ("translate", "status", "inspect"):
+        terminal = {"status": "succeeded", "receipt_validation": {"status": "valid"}}
+        terminals[f"C.{stage}"] = terminal
+    execution = {
+        "terminals": terminals,
+        "source_unchanged": True,
+        "preparation_unchanged": True,
+        "groups": {"C": {"durations": {"translate": 1.0}}},
+    }
+    cost = {
+        "price_status": "unknown",
+        "price_date": None,
+        "groups": {
+            "preparation": {"tokens": {"calls": 1}, "cost": {"status": "unknown"}},
+            "C": {"tokens": {"calls": 2}, "cost": {"status": "unknown"}},
+        },
+        "aggregate_cost": {"status": "unknown", "amount": None},
+        "aggregate_tokens": {"calls": 3},
+    }
+
+    report = write_report(
+        root=root,
+        manifest=manifest,
+        extraction=extraction,
+        execution=execution,
+        cost=cost,
+    )
+
+    assert report["execution_ok"] is False
+    assert report["conclusion"] == "failed"
+    assert any(
+        "without a current reflection artifact" in reason for reason in report["execution_reasons"]
+    )
+    markdown = (root / "report" / "summary.md").read_text(encoding="utf-8")
+    assert "### Reflection evidence" in markdown
+    assert "never counted as adoption" in markdown
+    assert report["reflection"]["C"]["status"] == "stale"

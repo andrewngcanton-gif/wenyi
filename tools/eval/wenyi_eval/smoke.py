@@ -30,6 +30,9 @@ from .fixture import fixture_metadata, write_fixture
 from .manifest import (
     BASELINE_REF,
     BASELINE_SHA,
+    DEFAULT_GROUPS,
+    WP0_REF,
+    WP0_SHA,
     build_group_plans,
     build_manifest,
     load_manifest,
@@ -56,15 +59,29 @@ def _find_baseline(repo_root: Path, override: str | None) -> Path:
     )
 
 
+def _find_wp0(repo_root: Path, override: str | None) -> Path:
+    if override:
+        candidate = Path(override).resolve()
+        if not candidate.is_dir():
+            raise EvalError(f"WP0 code source does not exist: {candidate}")
+        return candidate
+    for candidate in (repo_root / WP0_REF, repo_root.parent / WP0_REF):
+        if candidate.is_dir():
+            return candidate.resolve()
+    raise EvalError(
+        f"Cannot find the frozen WP0 checkout at {WP0_REF}. Pass --wp0 PATH; it must be at "
+        f"{WP0_SHA}."
+    )
+
+
 def _unknown_notes() -> list[str]:
     return [
-        "The A-prime candidate code SHA is not frozen; this smoke is diagnostic and not a "
-        "comparable baseline.",
-        "WP0 edits are uncommitted; the candidate binding is unfrozen/dirty and cannot be "
-        "used for a real comparison.",
+        "A_prime/A_prime2/B bind the frozen WP0 checkout; when selected, C/C_keep/D bind the "
+        "dirty WP2 working tree and remain diagnostic, unfrozen candidates.",
+        "The candidate binding is unfrozen/dirty and cannot be used for a real comparison.",
         "The external LLM provider boundary is replaced by a deterministic offline adapter.",
         "No licensed corpora, human ratings, or provider price rules are included.",
-        "WP2 reflection artifacts are unavailable; reflection is unsupported, not clean.",
+        "Reflection artifacts are diagnostic records; a current artifact is never clean.",
         "The smoke validates harness behavior, path isolation and evidence handling, not "
         "translation quality, model behavior or provider cost.",
     ]
@@ -75,6 +92,7 @@ def run_smoke(
     runs_dir: Path,
     eval_id: str,
     baseline: str | None,
+    wp0: str | None,
     timeout: float,
 ) -> dict:
     repo_root = Path(__file__).resolve().parents[3]
@@ -84,20 +102,29 @@ def run_smoke(
         raise EvalError(
             f"Baseline checkout is at {baseline_identity.head_sha}, expected {BASELINE_SHA}"
         )
+    wp0_source = _find_wp0(repo_root, wp0)
+    wp0_identity = git_identity(wp0_source)
+    if wp0_identity.head_sha != WP0_SHA:
+        raise EvalError(f"WP0 checkout is at {wp0_identity.head_sha}, expected {WP0_SHA}")
     baseline_tree_before = hash_tree(baseline_source / "packages")
+    wp0_tree_before = hash_tree(wp0_source / "packages")
 
     book = "lantern_harbor.en"
     root = initialize_root(runs_dir, eval_id=eval_id, book=book)
     with ownership_lock(root):
         source, fixture_path = write_fixture(root / "source")
-        config_hashes = write_variant_configs(root)
+        config_hashes = write_variant_configs(root, groups=DEFAULT_GROUPS)
         plans = build_group_plans(
             root,
             baseline_source=baseline_source,
+            wp0_source=wp0_source,
             candidate_source=repo_root,
+            wp0_expected_sha=WP0_SHA,
             candidate_expected_sha="unfrozen",
             diagnostic=True,
+            requested_groups=DEFAULT_GROUPS,
             baseline_binding={"adapter": "offline"},
+            wp0_binding={"adapter": "offline"},
             candidate_binding={"adapter": "offline"},
         )
         fixture = fixture_metadata()
@@ -162,12 +189,19 @@ def run_smoke(
             baseline_tree_before == baseline_tree_after
             and baseline_status_after.status_sha256 == baseline_identity.status_sha256
         )
+        wp0_tree_after = hash_tree(wp0_source / "packages")
+        wp0_status_after = git_identity(wp0_source)
+        wp0_unchanged = (
+            wp0_tree_before == wp0_tree_after
+            and wp0_status_after.status_sha256 == wp0_identity.status_sha256
+        )
         result = {
             "protocol_version": 1,
             "created_at": utc_now(),
             "eval_id": eval_id,
             "root": str(root),
             "source": str(source),
+            "groups": list(loaded["groups"]),
             "fixture_metadata": str(fixture_path),
             "manifest": str(root / "manifest.json"),
             "extraction": str(root / "extraction.json"),
@@ -195,6 +229,8 @@ def run_smoke(
             "negative_controls": controls,
             "baseline_unchanged": baseline_unchanged,
             "baseline_tree_sha256": baseline_tree_before,
+            "wp0_unchanged": wp0_unchanged,
+            "wp0_tree_sha256": wp0_tree_before,
             "terminals": {
                 key: row["status"] for key, row in artifact["execution"]["terminals"].items()
             },
@@ -202,6 +238,8 @@ def run_smoke(
         write_json_atomic(root / "smoke.json", result)
         if not baseline_unchanged:
             raise EvalError("The read-only baseline checkout changed during the smoke")
+        if not wp0_unchanged:
+            raise EvalError("The frozen WP0 checkout changed during the smoke")
         if not controls["passed"]:
             raise EvalError("One or more negative controls failed")
         if not report["execution_ok"]:
@@ -215,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs-dir", required=True, help="Absolute disposable runs directory")
     parser.add_argument("--eval-id", default=None, help="New evaluation id (default: timestamp)")
     parser.add_argument("--baseline", default=None, help="Read-only baseline checkout")
+    parser.add_argument("--wp0", default=None, help="Frozen WP0 checkout")
     parser.add_argument(
         "--timeout", type=float, default=900.0, help="Per-command timeout in seconds"
     )
@@ -232,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             runs_dir=Path(args.runs_dir),
             eval_id=eval_id,
             baseline=args.baseline,
+            wp0=args.wp0,
             timeout=args.timeout,
         )
     except EvalError as error:

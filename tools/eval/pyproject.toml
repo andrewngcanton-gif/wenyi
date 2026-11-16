@@ -1,7 +1,7 @@
 [project]
 name = "wenyi-eval"
 version = "0.0.0"
-description = "Isolated WP1a evaluation harness for Wenyi variants."
+description = "Isolated evaluation harness for Wenyi variants."
 requires-python = ">=3.10"
 dependencies = [
     "wenyi-core",
@@ -17,7 +17,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-wenyi-core = { path = "../../packages/core" }
+wenyi-core = { path = "../../packages/core", editable = true }
 
 # Keep this project out of the repository's uv workspace. The harness owns its
 # own lock and environment and must not change the root uv.lock.

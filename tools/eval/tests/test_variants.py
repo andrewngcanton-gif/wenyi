@@ -24,9 +24,8 @@ def test_every_group_has_a_template_and_unsupported_groups_fail() -> None:
     for group in SUPPORTED_GROUPS:
         assert load_group_template(group)["pipeline"]["review"] is True
 
-    for group in ("C", "C_keep", "D", "E"):
-        with pytest.raises(EvalError, match="unsupported"):
-            require_group_supported(group)
+    with pytest.raises(EvalError, match="unsupported"):
+        require_group_supported("E")
     with pytest.raises(EvalError, match="Unknown evaluation group"):
         require_group_supported("Z")
 
@@ -43,12 +42,14 @@ def test_b_disables_polish_and_reflective_templates_are_deferred() -> None:
 
 
 def test_runtime_configs_bind_isolated_state_and_keep_b_unpolished(tmp_path: Path) -> None:
+    from wenyi_eval.manifest import DEFAULT_GROUPS
+
     hashes = write_variant_configs(tmp_path)
 
-    assert set(hashes) == set(SUPPORTED_GROUPS)
+    assert set(hashes) == set(DEFAULT_GROUPS)
     configs = {
         group: yaml.safe_load((tmp_path / group / "config.yaml").read_text(encoding="utf-8"))
-        for group in SUPPORTED_GROUPS
+        for group in DEFAULT_GROUPS
     }
     assert configs["B"]["pipeline"]["polish"] is False
     assert configs["A"]["pipeline"]["polish"] is True
@@ -75,6 +76,7 @@ def test_translate_arguments_follow_the_group_polish_setting(tmp_path: Path) -> 
 def test_group_plans_record_explicit_unknown_routes(tmp_path: Path) -> None:
     baseline = init_git_repo(tmp_path / "baseline")
     candidate = init_git_repo(tmp_path / "candidate")
+    wp0 = init_git_repo(tmp_path / "wp0")
     root = tmp_path / "eval"
     root.mkdir()
 
@@ -82,6 +84,8 @@ def test_group_plans_record_explicit_unknown_routes(tmp_path: Path) -> None:
         root,
         baseline_source=baseline,
         candidate_source=candidate,
+        wp0_source=wp0,
+        wp0_binding={"adapter": "offline"},
         candidate_expected_sha="unfrozen",
         diagnostic=True,
         baseline_binding={"adapter": "offline"},

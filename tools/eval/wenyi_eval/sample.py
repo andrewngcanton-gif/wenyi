@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from .common import EvalError, PathGuard, append_jsonl, read_jsonl, utc_now, write_json_atomic
-from .manifest import SUPPORTED_GROUPS
 
 MIN_PARAGRAPHS = 200
 MAX_PARAGRAPHS = 300
@@ -213,7 +212,7 @@ def build_samples(
         "license": fixture["license"],
         "provenance": fixture["provenance"],
         "source_sha256": source["sha256"],
-        "groups": list(SUPPORTED_GROUPS),
+        "groups": list(manifest.get("groups") or {}),
     }
     write_json_atomic(directory / "selection.json", selection)
     return selection

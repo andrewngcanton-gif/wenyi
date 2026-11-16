@@ -39,10 +39,42 @@ _FORBIDDEN_FILES = re.compile(
 )
 
 
-def write_prepare_config(root: Path, *, base_config: dict[str, Any] | None = None) -> Path:
+def write_prepare_config(
+    root: Path,
+    *,
+    group: str = "A_prime",
+    base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+) -> Path:
     guard = PathGuard(root)
-    config = variant_config("A_prime", guard.child("_prepared", "staging"), base=base_config)
+    config = variant_config(
+        group,
+        guard.child("_prepared", "staging"),
+        base=base_config,
+        reflect_model=reflect_model,
+    )
     path = guard.child("config", "prepare.yaml")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return path
+
+
+def write_group_prepare_config(
+    root: Path,
+    group: str,
+    *,
+    base_config: dict[str, Any] | None = None,
+    reflect_model: str | None = None,
+) -> Path:
+    """Write the isolated preparation configuration for one incompatible group."""
+    guard = PathGuard(root)
+    config = variant_config(
+        group,
+        guard.child(group, "_prepared", "staging"),
+        base=base_config,
+        reflect_model=reflect_model,
+    )
+    path = guard.child(group, "_prepared", "prepare.yaml")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return path
@@ -103,15 +135,16 @@ def create_snapshot(
     run_dir: Path,
     expected_source_sha256: str,
     expected_target_lang: str,
+    snapshot_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Write a fresh prepared tree under ``_prepared/state`` and return its receipt."""
     from wenyi_core.models.document import Chapter
     from wenyi_core.storage.file import FileStorage
 
     guard = PathGuard(root)
-    snapshot_root = guard.child("_prepared")
-    snapshot_state = guard.child("_prepared", "state")
-    metadata_path = guard.child("_prepared", "snapshot.json")
+    snapshot_root = guard.ensure(snapshot_dir) if snapshot_dir else guard.child("_prepared")
+    snapshot_state = snapshot_root / "state"
+    metadata_path = snapshot_root / "snapshot.json"
     if snapshot_state.exists() or metadata_path.exists():
         raise EvalError(f"Refusing to overwrite an existing preparation snapshot: {snapshot_root}")
 
@@ -270,6 +303,10 @@ def read_snapshot_receipt(root: Path) -> dict[str, Any]:
     return read_json(guard.child("_prepared", "snapshot.json"))
 
 
+def read_snapshot_receipt_at(snapshot_dir: Path) -> dict[str, Any]:
+    return read_json(Path(snapshot_dir) / "snapshot.json")
+
+
 def snapshot_source_digest(state: Path) -> str:
     return sha256_file(state / "manifest.json")
 
@@ -376,3 +413,51 @@ def compare_preparation_identity(actual: dict[str, Any], expected: dict[str, Any
         elif any(policy != expected["chapter_digest_policy"] for policy in actual_digests):
             reasons.append("prescan chapter digest policy differs")
     return reasons
+
+
+def expected_reflection_identity(
+    config_path: str | os.PathLike[str],
+    *,
+    source_sha256: str,
+    source_lang: str,
+) -> dict[str, Any]:
+    """Reconstruct the reflection policy and configured route evidence.
+
+    Everything here is derived from the group configuration and the product's
+    route resolver, never from the artifact being validated. The artifact reader
+    then compares its stored hashes against this independently produced identity.
+    """
+    from wenyi_core.config_rebuild import load_rebuilt_config
+    from wenyi_core.llm.routing import resolve_routes
+    from wenyi_core.pipeline.translate.reflection_records import CODE_IDENTITY
+
+    config = load_rebuilt_config(config_path)
+    config.source_lang = source_lang
+    config.freeze_language_policies(source_sha256)
+    plan = config.language_policy("translation")
+    pipeline = config.pipeline
+    routes = resolve_routes(config.llm)
+    operations = ("reflect.body", "polish.body", "translation.body")
+    return {
+        "policy": {
+            "code_identity": CODE_IDENTITY,
+            "reflective_polish": True,
+            "min_severity": pipeline.reflect_min_severity,
+            "clean_action": pipeline.reflect_clean_batches,
+            "reflector_fingerprint": plan.task_fingerprint("reflector"),
+            "translation_fingerprint": plan.fingerprint,
+        },
+        "configured_route_fingerprints": {
+            operation: routes[operation].fingerprint for operation in operations
+        },
+        "configured_routes": {
+            operation: {
+                "profile": routes[operation].profile,
+                "model": routes[operation].model,
+                "provider": routes[operation].provider,
+                "origin": routes[operation].origin,
+                "inference_fingerprint": routes[operation].fingerprint,
+            }
+            for operation in operations
+        },
+    }

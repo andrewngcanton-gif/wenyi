@@ -223,3 +223,20 @@ def test_seed_state_preserves_digest_and_refuses_tampered_or_nonempty_trees(
             root / "B" / "state" / "book.en" / "targets" / "zh",
             expected_digest=receipt["tree_sha256"],
         )
+
+
+def test_snapshot_can_be_written_to_an_isolated_group_directory(tmp_path: Path) -> None:
+    root, run = _prepare_run(tmp_path)
+    receipt = create_snapshot(
+        root=root,
+        run_dir=run,
+        expected_source_sha256="a" * 64,
+        expected_target_lang="zh",
+        snapshot_dir=root / "C" / "_prepared",
+    )
+
+    isolated = root / "C" / "_prepared"
+    assert (isolated / "state" / "manifest.json").is_file()
+    assert (isolated / "snapshot.json").is_file()
+    assert not (root / "_prepared" / "state").exists()
+    assert receipt["tree_sha256"] == hash_tree(isolated / "state")

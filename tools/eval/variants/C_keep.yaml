@@ -1,5 +1,6 @@
-# Group C-keep template for WP2 reflective polish with clean batches kept. It is
-# intentionally not runnable until the reflective-polish implementation exists.
+# Group C-keep: group C with reflect_clean_batches=keep, so a validated clean
+# batch keeps its draft instead of paying for a polish call. All other switches
+# match group C.
 language:
   source: en
   target: zh
