@@ -70,6 +70,8 @@ def test_prompt_genre_rejects_unknown_values_before_workflows(tmp_path, option, 
 def test_help_advertises_translation_style_as_a_supported_option(
     tmp_path, monkeypatch, force_terminal
 ):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", force_terminal)
     result = CliRunner().invoke(app, ["--config", str(tmp_path / "config.yaml"), "--help"])
     assert result.exit_code == 0, result.output

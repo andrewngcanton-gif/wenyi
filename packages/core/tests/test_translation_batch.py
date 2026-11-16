@@ -68,6 +68,16 @@ def test_batch_polish_preserves_filtered_positions_and_fallback(invalid_continua
     )
     assert client.calls[1]["messages"][:2] == client.calls[0]["messages"]
     assert client.calls[1]["messages"][2]["role"] == "assistant"
+    if invalid_continuation:
+        # The standalone fallback keeps the filtered plan sources as numbered references.
+        fallback_user = client.calls[-1]["messages"][1]["content"]
+        header = "[Current source paragraphs: reference only, not additional output items]"
+        assert header in fallback_user
+        source_block = fallback_user.split(header, 1)[1]
+        positions = [
+            source_block.index(f"[{index}] {source}") for index, source in enumerate(plan.sources)
+        ]
+        assert positions == sorted(positions)
     rules = dict(config.language_policy().prompt_values)
     for call in client.calls:
         # Continuation repeats the complete rules in its own user turn.
@@ -75,6 +85,41 @@ def test_batch_polish_preserves_filtered_positions_and_fallback(invalid_continua
         assert rules["target_guidance"] in instruction
         assert read_text("shared/target_language.txt").strip() in instruction
         assert rules["punct_rule"] in instruction
+
+
+@pytest.mark.parametrize("genre", ["literary", "academic"])
+def test_per_segment_translation_fallback_polish_receives_plan_sources(genre):
+    def handler(messages, tier, json_mode):
+        system = messages[0]["content"]
+        user = messages[-1]["content"]
+        if "prose editor" in system:
+            return json.dumps({"polished": ["ONE", "TWO"]})
+        if "2 paragraphs, numbered 0 through 1" in user:
+            return json.dumps({"translations": ["alignment mismatch"]})
+        return json.dumps({"translations": ["translated"]})
+
+    config = Config.from_dict({"llm": {"preset": "fake"}})
+    config.set_prompt_genre(genre)
+    client = FakeClient(handler=handler)
+    executor = TranslationBatchExecutor(Translator(client, config), Polisher(client, config))
+    plan = _plan(["alpha", "beta"])
+    result = executor.execute(plan, polish=True)
+
+    assert result.targets == ("ONE", "TWO")
+    assert result.before_polish == ("translated", "translated")
+    assert [call["operation"] for call in client.calls[-3:]] == [
+        "translation.body",
+        "translation.body",
+        "polish.body",
+    ]
+    fallback = client.calls[-1]
+    assert len(fallback["messages"]) == 2
+    user = fallback["messages"][1]["content"]
+    header = "[Current source paragraphs: reference only, not additional output items]"
+    assert header in user
+    source_block = user.split(header, 1)[1]
+    assert source_block.index("[0] alpha") < source_block.index("[1] beta")
+    assert "exactly 2 items" in user
 
 
 def test_batch_passes_mineru_blank_allowance_to_translator():

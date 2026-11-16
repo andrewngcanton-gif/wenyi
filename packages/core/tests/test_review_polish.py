@@ -574,6 +574,63 @@ class TestPolisher(unittest.TestCase):
         self.assertEqual(out, ["甲"])
         self.assertTrue(any("returning fallback" in line for line in captured.output))
 
+    def test_polish_standalone_includes_numbered_sources_in_every_terminology_mode(self):
+        header = "[Current source paragraphs: reference only, not additional output items]"
+        for genre in ("literary", "academic"):
+            for terminology_context in (False, True):
+                with self.subTest(genre=genre, terminology_context=terminology_context):
+                    cfg = _cfg()
+                    cfg.set_prompt_genre(genre)
+                    cfg.pipeline.terminology_context = terminology_context
+                    client = FakeClient(
+                        handler=lambda m, t, j: json.dumps(
+                            {"polished": ["润色甲", "润色乙"]}, ensure_ascii=False
+                        )
+                    )
+                    terms = [GlossaryTerm(source="源文甲", target="译文甲", note="本地注释")]
+                    out = Polisher(client, cfg).polish(
+                        ["译文甲", "译文乙"],
+                        glossary_terms=terms,
+                        sources=["源文甲", "源文乙"],
+                    )
+                    self.assertEqual(out, ["润色甲", "润色乙"])
+                    user = client.calls[-1]["messages"][1]["content"]
+                    self.assertIn(header, user)
+                    header_at = user.index(header)
+                    source0 = user.index("[0] 源文甲")
+                    source1 = user.index("[1] 源文乙")
+                    target0 = user.index("[0] 译文甲")
+                    self.assertLess(header_at, source0)
+                    self.assertLess(source0, source1)
+                    self.assertLess(source1, target0)
+                    self.assertEqual(user.count("[0] "), 2)
+                    self.assertEqual(user.count("[1] "), 2)
+                    # Source-scoped glossary notes remain an experimental terminology feature.
+                    self.assertEqual("本地注释" in user, terminology_context)
+
+    def test_polish_standalone_without_sources_omits_source_reference(self):
+        for genre in ("literary", "academic"):
+            for terminology_context in (False, True):
+                for sources in (None, []):
+                    with self.subTest(
+                        genre=genre, terminology_context=terminology_context, sources=sources
+                    ):
+                        cfg = _cfg()
+                        cfg.set_prompt_genre(genre)
+                        cfg.pipeline.terminology_context = terminology_context
+                        client = FakeClient(
+                            handler=lambda m, t, j: json.dumps(
+                                {"polished": ["润色甲", "润色乙"]}, ensure_ascii=False
+                            )
+                        )
+                        out = Polisher(client, cfg).polish(["译文甲", "译文乙"], sources=sources)
+                        self.assertEqual(out, ["润色甲", "润色乙"])
+                        user = client.calls[-1]["messages"][1]["content"]
+                        self.assertNotIn("[Current source paragraphs:", user)
+                        self.assertNotIn("[0] 源文", user)
+                        self.assertEqual(user.count("[0] "), 1)
+                        self.assertEqual(user.count("[1] "), 1)
+
     def test_polish_continue_appends_user_turn_to_translation_transcript(self):
         client = FakeClient(
             handler=lambda m, t, j: json.dumps(

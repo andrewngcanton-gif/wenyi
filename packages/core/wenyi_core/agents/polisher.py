@@ -44,7 +44,7 @@ class Polisher(Agent):
             source_context=(
                 "[Current source paragraphs: reference only, not additional output items]\n"
                 + prompts.numbered(sources)
-                if sources and self.config.pipeline.terminology_context
+                if sources
                 else ""
             ),
             style=style or "(none)",
