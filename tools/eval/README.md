@@ -37,11 +37,12 @@ uv run --project tools/eval python -m wenyi_eval.run_variants run \
 
 `plan` writes the manifest using local CLI metadata commands without translating.
 `extract`, `export`, `import` and `report` rebuild later stages of an existing
-`--root`. Provider mode runs the selected product factory with no evaluation
-monkeypatch; the offline adapter is used only with an explicit `--adapter
-offline`. The executable and argv are the command that actually runs, and
-`models list --json` / `models explain --operation` metadata is captured and
-redacted.
+`--root`. Add `--protocol /absolute/registered-protocol.json` to `run` for a
+formal pre-registered experiment; without it the run stays diagnostic. Provider
+mode runs the selected product factory with no evaluation monkeypatch; the
+offline adapter is used only with an explicit `--adapter offline`. The executable
+and argv are the command that actually runs, and `models list --json` /
+`models explain --operation` metadata is captured and redacted.
 
 ## Three code bindings
 
@@ -147,21 +148,81 @@ missing counter stays unknown, and unclassified input is only priced when the
 declared rule proves every allocation has the same rate. Unknown prices stay
 unknown, never zero. Isolated preparation is charged as its own scope.
 
+## Formal protocol and quality gates
+
+A real quality claim needs a pre-registration. `plan`/`run --protocol <file>`
+validates and freezes comparisons, cluster unit, holdout chapters, seed,
+resampling method and every threshold in `experiment_protocol.frozen.json`
+before any translation output exists. Later stages verify the stored hash and
+reject a protocol edited after output; a missing protocol keeps the legacy run
+diagnostic/inconclusive. Generate a clearly labelled draft with:
+
+```bash
+uv run --project tools/eval python -m wenyi_eval.run_variants protocol-template \
+  --out /absolute/protocol.draft.json
+```
+
+The draft thresholds are suggestions, not an approved study. Confirmatory
+comparisons must use `A_prime` as the baseline; multiple confirmatory
+comparisons require a declared correction (Holm/Bonferroni). `C_keep` may be
+exploratory or explicitly registered. A pilot scope or a holdout without
+selected and assessed source evidence can never produce a release-quality pass.
+Holdout chapters must exist in the
+source inventory, be selected separately from the main sample, and have recorded
+paired assessments with sufficient clusters and passing preference, MQM and
+severe-error checks. Setting `sampling.holdout.verified` to `true` alone is not
+held-out evidence.
+
+Reports evaluate every HLD 9.4 gate separately: preference (cluster-paired
+two-sided 95% lower bound > 50% plus human MQM non-deterioration), omission and
+addition (one-sided 95% upper bound <= +1pp on paired assessable segments),
+severe newly introduced mistranslation (blocks with failed), degradation over
+segments the candidate actually edited (one-sided 95% upper bound <= 5%), body
+cost ratio <= 1.40 on the same complete workload, completeness, frozen evidence,
+multiple-comparison correction and final holdout. All-win/all-loss preference,
+zero candidate defects and zero confirmed degradations return unavailable
+intervals and inconclusive gates. A binomial bound over clusters cannot establish
+the pooled segment error-rate bound when cluster sizes differ, and an all-zero
+bootstrap cannot prove a threshold. Workflow execution and empirical quality are reported
+separately, and diagnostic/synthetic runs are always inconclusive.
+
+Human material is extended with per-side MQM error counts and severe flags in
+`samples/pairwise.csv`, plus a separate blind before/after packet in
+`samples/edit_review.csv`. Annotations are bound to source segment and text
+hashes; changed outputs or stale keys invalidate the whole submission. Human
+origin is caller-reported and the design is anonymous, never double blind.
+Combined import validates both CSVs before committing either; an invalid CSV
+leaves prior ratings and import summaries unchanged. Reporting revalidates the
+current persisted protocol, keys, texts and annotation bindings instead of
+trusting an earlier successful import or its summary.
+
+Human scoring remains deferred until the final frozen-material stage. Prepare
+the registered protocol, model profiles, licensed data and budget before any
+paid study. Toolchain readiness is not empirical quality evidence, and
+`reflective_polish` remains off by default pending all required gates.
+See [FINAL_ACCEPTANCE.zh.md](FINAL_ACCEPTANCE.zh.md) for the Chinese
+final-acceptance checklist.
+
 ## Layout and modules
 
 ```text
 tools/eval/
   README.md
+  FINAL_ACCEPTANCE.zh.md
   pyproject.toml
   variants/            # complete per-group config templates
   examples/            # en->zh and ja->zh examples; no corpus included
   wenyi_eval/
     manifest.py        # identities, explicit argv/paths, group bindings
+    protocol.py        # frozen pre-registration, content hash, draft template
     sample.py          # pilot selection and stratified human-review packets
     run_variants.py    # prepare once, seed snapshots, run selected groups
     extract.py         # public FileStorage reads aligned by source/index
     reflection.py      # WP2 artifact identity and status evidence
-    pairwise.py        # anonymous pairwise export and rating import
+    pairwise.py        # anonymous pairwise export, rating import, hash binding
+    edit_review.py     # blind before/after edit packet for degradation
+    stats.py           # cluster-paired resampling and conservative sparse handling
+    gates.py           # HLD 9.4 gate-by-gate tri-state evaluation
     cost.py            # operation ledger, cache/time, unknown-not-zero cost
     report.py          # Markdown/CSV report and tri-state conclusion
 ```

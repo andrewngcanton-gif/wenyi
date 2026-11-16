@@ -103,6 +103,11 @@ def test_export_preserves_missing_pairs_instead_of_dropping_them(tmp_path: Path)
     assert preregistration["expected_pairs"] == 4
     assert preregistration["missing_pairs"] == 2
     assert preregistration["denominator"] == 4
+    assert preregistration["comparison_denominators"] == {
+        "A_vs_Aprime": {"main": 2, "holdout": 0},
+        "A_vs_B": {"main": 2, "holdout": 0},
+        "Aprime_vs_B": {"main": 2, "holdout": 0},
+    }
     missing = [
         json.loads(line)
         for line in (root / "samples" / "pairwise_missing.jsonl")

@@ -1,0 +1,59 @@
+{
+  "comparisons": [
+    {
+      "baseline": "A_prime",
+      "candidate": "C",
+      "id": "Aprime_vs_C",
+      "role": "confirmatory"
+    },
+    {
+      "baseline": "A_prime",
+      "candidate": "D",
+      "id": "Aprime_vs_D",
+      "role": "confirmatory"
+    },
+    {
+      "baseline": "A_prime",
+      "candidate": "C_keep",
+      "id": "Aprime_vs_C_keep",
+      "role": "exploratory"
+    }
+  ],
+  "decision": {
+    "addition_max_delta": 0.01,
+    "cost_max_ratio": 1.4,
+    "degradation_max": 0.05,
+    "omission_max_delta": 0.01,
+    "preference": {
+      "lower_bound": 0.5,
+      "mqm_max_mean_increase": 0.0
+    },
+    "severe_new_mistranslation": "failed"
+  },
+  "draft_notice": "DRAFT suggestions only. They are not user-approved thresholds, were not run, and must be reviewed and registered before any translation output exists.",
+  "experiment_id": "replace-with-a-unique-experiment-id",
+  "protocol_version": 2,
+  "sampling": {
+    "block_size": null,
+    "clusters": "chapter",
+    "holdout": {
+      "chapters": [],
+      "verified": false
+    },
+    "max_paragraphs": 300,
+    "min_paragraphs": 200,
+    "seed": 20261116
+  },
+  "scope": "pilot",
+  "statistics": {
+    "confidence": 0.95,
+    "method": "cluster_paired_bootstrap",
+    "min_assessable_fraction": 0.95,
+    "min_clusters": 20,
+    "multiple_comparisons": "holm",
+    "resamples": 10000,
+    "seed": 20261116
+  },
+  "status": "DRAFT",
+  "title": "DRAFT threshold suggestions for a future experiment"
+}

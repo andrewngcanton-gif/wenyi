@@ -113,6 +113,19 @@ def test_cli_help_is_a_real_entrypoint(capsys: pytest.CaptureFixture[str]) -> No
     assert error.value.code == 0
     output = capsys.readouterr().out
     assert "plan" in output and "run" in output and "extract" in output
+    assert "protocol-template" in output
+
+
+def test_protocol_template_subcommand_writes_a_draft(tmp_path: Path) -> None:
+    from wenyi_eval.run_variants import main
+
+    target = tmp_path / "draft.json"
+
+    assert main(["protocol-template", "--out", str(target)]) == 0
+    assert target.is_file()
+    text = target.read_text(encoding="utf-8")
+    assert '"DRAFT"' in text
+    assert "draft_notice" in text
 
 
 def test_child_command_uses_the_declared_executable_and_argv() -> None:

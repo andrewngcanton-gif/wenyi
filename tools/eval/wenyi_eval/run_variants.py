@@ -49,6 +49,12 @@ from .manifest import (
     write_manifest,
     write_variant_configs,
 )
+from .protocol import (
+    ProtocolError,
+    confirmatory_comparisons,
+    freeze_protocol,
+    write_draft_template,
+)
 from .snapshot import (
     PreparationIncompatibilityError,
     compare_preparation_identity,
@@ -1249,6 +1255,53 @@ def _language(args: argparse.Namespace, base: dict[str, Any] | None) -> tuple[st
     return source, target
 
 
+def _validate_protocol_groups(
+    *,
+    protocol: dict[str, Any],
+    requested: tuple[str, ...],
+    seed: int,
+    human_min: int,
+    human_max: int,
+) -> None:
+    """Refuse a protocol that cannot be executed as frozen."""
+    required = {item["baseline"] for item in confirmatory_comparisons(protocol)} | {
+        item["candidate"] for item in confirmatory_comparisons(protocol)
+    }
+    missing = required - set(requested)
+    if missing:
+        raise ProtocolError(
+            "Confirmatory protocol groups were not selected: " + ", ".join(sorted(missing))
+        )
+    sampling = protocol["sampling"]
+    if sampling["seed"] != seed:
+        raise ProtocolError(
+            f"Protocol sampling seed {sampling['seed']} differs from --seed {seed}; the frozen "
+            "seed is never replaced by a CLI default"
+        )
+    if (sampling["min_paragraphs"], sampling["max_paragraphs"]) != (human_min, human_max):
+        raise ProtocolError(
+            "Protocol paragraph limits differ from --human-min/--human-max; the frozen sampling "
+            "definition is never rewritten"
+        )
+
+
+def _protocol_manifest_entry(binding: dict[str, Any] | None) -> dict[str, Any] | None:
+    if binding is None:
+        return None
+    data = binding["protocol"]
+    return {
+        "status": "valid",
+        "content_sha256": binding["content_sha256"],
+        "frozen_at": binding["frozen_at"],
+        "experiment_id": data["experiment_id"],
+        "scope": data["scope"],
+        "comparisons": data["comparisons"],
+        "sampling": data["sampling"],
+        "statistics": data["statistics"],
+        "decision": data["decision"],
+    }
+
+
 def _build_evaluation(
     args: argparse.Namespace, *, execute_after: bool
 ) -> tuple[Path, dict[str, Any], dict[str, Any] | None]:
@@ -1288,6 +1341,17 @@ def _build_evaluation(
     base_config = load_user_config(args.config) if args.config else None
     source_lang, target_lang = _language(args, base_config)
     with ownership_lock(root):
+        protocol_binding = (
+            freeze_protocol(root, args.protocol) if getattr(args, "protocol", None) else None
+        )
+        if protocol_binding is not None:
+            _validate_protocol_groups(
+                protocol=protocol_binding["protocol"],
+                requested=requested,
+                seed=args.seed,
+                human_min=args.human_min,
+                human_max=args.human_max,
+            )
         copied = root / "source" / source.name
         copied.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, copied)
@@ -1388,6 +1452,23 @@ def _build_evaluation(
             ),
             sampling={"min": args.human_min, "max": args.human_max},
         )
+        manifest["protocol"] = _protocol_manifest_entry(protocol_binding) or {
+            "status": "missing",
+            "reason": (
+                "No --protocol was supplied. This run remains diagnostic and its gates cannot "
+                "produce a formal quality pass."
+            ),
+        }
+        if protocol_binding is not None:
+            manifest["unknowns"].append(
+                "A frozen experiment protocol was registered before execution; human ratings "
+                "remain caller-reported and are not identity-verified."
+            )
+            if protocol_binding["protocol"].get("scope") != "release":
+                manifest["unknowns"].append(
+                    "The frozen protocol scope is a pilot: a 200-300 paragraph pilot is not a "
+                    "general or release-quality result."
+                )
         loaded = prepare_manifest(
             root=root,
             manifest=manifest,
@@ -1411,18 +1492,33 @@ def _build_evaluation(
 
 
 def _finish(root: Path, manifest: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
+    from .annotation_import import import_annotations
     from .cost import build_cost_summary
+    from .edit_review import export_edit_review
     from .extract import extract_all
-    from .pairwise import export_pairwise, import_pairwise_ratings
+    from .pairwise import export_pairwise
+    from .protocol import verify_binding
     from .report import write_report
     from .sample import build_samples
 
+    protocol_state = verify_binding(root)
+    protocol = protocol_state.get("protocol") if protocol_state.get("status") == "valid" else None
     extraction = extract_all(root=root, manifest=manifest)
     selection = build_samples(
-        root=root, manifest=manifest, extraction=extraction, limits=manifest.get("sampling")
+        root=root,
+        manifest=manifest,
+        extraction=extraction,
+        limits=manifest.get("sampling"),
+        protocol=protocol,
     )
-    export_pairwise(root=root, manifest=manifest, extraction=extraction)
-    import_pairwise_ratings(root, root / "samples" / "pairwise.csv")
+    export_pairwise(root=root, manifest=manifest, extraction=extraction, protocol=protocol)
+    export_edit_review(root=root, manifest=manifest, extraction=extraction, protocol=protocol)
+    import_annotations(
+        root,
+        root / "samples" / "pairwise.csv",
+        root / "samples" / "edit_review.csv",
+        extraction=extraction,
+    )
     cost = build_cost_summary(
         root=root, manifest=manifest, extraction=extraction, execution=execution
     )
@@ -1505,6 +1601,11 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--config", default=None, help="User configuration YAML")
     parser.add_argument("--prices", default=None, help="Optional provider price rule JSON")
+    parser.add_argument(
+        "--protocol",
+        default=None,
+        help="Optional formal experiment protocol JSON frozen before execution",
+    )
     parser.add_argument("--seed", type=int, default=20261116, help="Sampling seed")
     parser.add_argument("--human-min", type=int, default=200, help="Minimum human sample rows")
     parser.add_argument("--human-max", type=int, default=300, help="Maximum human sample rows")
@@ -1555,6 +1656,16 @@ def _print_summary(root: Path, result: dict[str, Any]) -> None:
     print(f"Manifest: {root / 'manifest.json'}")
     print(f"Report: {root / 'report' / 'summary.md'}")
     print(f"Conclusion: {report.get('conclusion', 'not run')}")
+    if report.get("quality_conclusion"):
+        print(
+            "Empirical quality: "
+            f"{report['quality_conclusion']} (scope {report.get('conclusion_scope')})"
+        )
+    for name in (report.get("failed_required_gates") or []) + (
+        report.get("inconclusive_required_gates") or []
+    ):
+        gate = (report.get("gates") or {}).get(name) or {}
+        print(f"Gate {name}: {gate.get('status')} ({gate.get('reason')})")
     coverage = (result.get("extraction") or {}).get("groups", {})
     for group, item in coverage.items():
         print(f"Coverage {group}: {item.get('coverage')}")
@@ -1587,9 +1698,23 @@ def main(argv: list[str] | None = None) -> int:
     import_parser.add_argument(
         "--ratings", default=None, help="Ratings CSV (default: samples/pairwise.csv)"
     )
+    import_parser.add_argument(
+        "--edit-ratings",
+        default=None,
+        help="Before/after edit ratings CSV (default: samples/edit_review.csv)",
+    )
+    template_parser = subparsers.add_parser(
+        "protocol-template", help="Write a clearly labelled DRAFT protocol template"
+    )
+    template_parser.add_argument("--out", required=True, help="New JSON file to create")
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "protocol-template":
+            target = write_draft_template(args.out)
+            print(f"Draft protocol template: {target}")
+            print("This template is not a registration and must be reviewed before use.")
+            return 0
         if args.command in {"plan", "run"}:
             root, manifest, execution = _build_evaluation(args, execute_after=args.command == "run")
             if execution is None:
@@ -1609,28 +1734,53 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Coverage {group}: {item.get('coverage')}")
             return 0
         if args.command == "export":
-            from .extract import load_extraction
+            from .edit_review import export_edit_review
+            from .extract import extract_all
             from .pairwise import export_pairwise
+            from .protocol import verify_binding
             from .sample import build_samples
 
-            extraction = load_extraction(root)
-            build_samples(root=root, manifest=manifest, extraction=extraction)
-            export_pairwise(root=root, manifest=manifest, extraction=extraction)
+            extraction = extract_all(root=root, manifest=manifest)
+            state = verify_binding(root)
+            protocol = state.get("protocol") if state.get("status") == "valid" else None
+            build_samples(root=root, manifest=manifest, extraction=extraction, protocol=protocol)
+            export_pairwise(root=root, manifest=manifest, extraction=extraction, protocol=protocol)
+            export_edit_review(
+                root=root, manifest=manifest, extraction=extraction, protocol=protocol
+            )
             print(f"Samples: {root / 'samples'}")
+            print(f"Protocol: {state.get('status')} ({state.get('reason')})")
             return 0
         if args.command == "import":
-            from .pairwise import import_pairwise_ratings
+            from .annotation_import import import_annotations
+            from .extract import extract_all
 
             ratings = Path(args.ratings) if args.ratings else root / "samples" / "pairwise.csv"
-            result = import_pairwise_ratings(root, ratings)
+            edit_path = (
+                Path(args.edit_ratings)
+                if args.edit_ratings
+                else root / "samples" / "edit_review.csv"
+            )
+            if args.edit_ratings and not edit_path.is_file():
+                raise EvalError("The requested edit ratings file does not exist")
+            with ownership_lock(root):
+                extraction = extract_all(root=root, manifest=manifest)
+                result, edit_result = import_annotations(
+                    root, ratings, edit_path if edit_path.is_file() else None, extraction=extraction
+                )
             print(f"Imported ratings: {result['rated_rows']} of {result['denominator']}")
+            if edit_result is not None:
+                print(
+                    f"Imported edit ratings: {edit_result['assessed_rows']} of "
+                    f"{edit_result['denominator']} edited segments"
+                )
             return 0
         if args.command == "report":
             from .cost import build_cost_summary
-            from .extract import load_extraction
+            from .extract import extract_all
             from .report import write_report
 
-            extraction = load_extraction(root)
+            extraction = extract_all(root=root, manifest=manifest)
             execution = read_json(root / "records" / "execution.json")
             cost = build_cost_summary(
                 root=root, manifest=manifest, extraction=extraction, execution=execution

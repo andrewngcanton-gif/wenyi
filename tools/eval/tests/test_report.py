@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 from pathlib import Path
 
 import pytest
@@ -174,15 +173,11 @@ def test_execution_failure_is_reported_as_failed_even_for_a_diagnostic_run(
 
 
 @pytest.mark.parametrize(
-    ("preference", "preferred", "expected"),
-    [
-        ("left", "candidate", "passed"),
-        ("right", "candidate", "failed"),
-        ("left", "baseline", "failed"),
-    ],
+    ("preference", "preferred"),
+    [("left", "candidate"), ("right", "candidate"), ("left", "baseline")],
 )
-def test_preregistered_human_rule_can_pass_or_fail(
-    tmp_path: Path, preference: str, preferred: str, expected: str
+def test_legacy_point_estimate_rule_can_never_pass_or_fail(
+    tmp_path: Path, preference: str, preferred: str
 ) -> None:
     root = tmp_path / "eval"
     manifest = minimal_manifest(root)
@@ -190,11 +185,14 @@ def test_preregistered_human_rule_can_pass_or_fail(
 
     report = _report(root, manifest)
 
-    assert report["conclusion"] == expected
-    assert "Preregistered rule met" in report["decision_reason"]
+    assert report["conclusion"] == "inconclusive"
+    assert report["quality_conclusion"] == "inconclusive"
+    assert report["gates"]["protocol"]["status"] == "inconclusive"
+    assert "No frozen experiment protocol" in report["decision_reason"]
+    assert report["gates"]["protocol"]["details"]["status"] == "missing"
 
 
-def test_missing_human_ratings_or_decision_rule_stay_inconclusive(tmp_path: Path) -> None:
+def test_missing_human_ratings_or_protocol_stay_inconclusive(tmp_path: Path) -> None:
     root = tmp_path / "eval"
     manifest = minimal_manifest(root)
 
@@ -203,15 +201,10 @@ def test_missing_human_ratings_or_decision_rule_stay_inconclusive(tmp_path: Path
     assert "No pairwise ratings" in report["decision_reason"]
 
     _write_human_evidence(root, "left")
-    (root / "samples" / "pairwise_preregistration.json").write_text(
-        json.dumps(
-            {"comparisons": [{"id": "A_vs_Aprime", "baseline": "A", "candidate": "A_prime"}]}
-        ),
-        encoding="utf-8",
-    )
     report = _report(root, manifest)
     assert report["conclusion"] == "inconclusive"
-    assert "No preregistered statistical decision rule" in report["decision_reason"]
+    assert "No frozen experiment protocol" in report["decision_reason"]
+    assert report["empirical_evidence"] is False
 
 
 def test_missing_or_stale_reflection_is_reported_and_never_clean(tmp_path: Path) -> None:

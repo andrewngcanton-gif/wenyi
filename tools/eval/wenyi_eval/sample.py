@@ -134,34 +134,18 @@ def stratified_sample(
     return selected, {stratum: count for stratum, count in quotas.items() if count}
 
 
-def build_samples(
+def _enrich_rows(
+    rows: list[dict[str, Any]],
+    chapters: list[dict[str, Any]],
     *,
-    root: Path,
-    manifest: dict[str, Any],
-    extraction: dict[str, Any],
-    limits: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    guard = PathGuard(root)
-    directory = guard.child("samples")
-    directory.mkdir(parents=True, exist_ok=True)
-    minimum = int((limits or {}).get("min") or MIN_PARAGRAPHS)
-    maximum = int((limits or {}).get("max") or MAX_PARAGRAPHS)
-    if minimum < 1 or maximum < minimum:
-        raise EvalError("Human sampling limits must satisfy 1 <= min <= max")
-    seed = int(manifest["llm"]["seed"])
-    chapters = extraction["expected"]["chapters"]
-    window, window_detail = select_continuous_window(chapters, seed=seed, minimum=minimum)
-    selected_chapters = [chapters[index] for index in window]
-    rows = _paragraphs(selected_chapters)
-    if len(rows) < minimum:
-        raise SampleSizeError(len(rows))
-    size = min(maximum, max(minimum, round(len(rows) * 0.8)))
-    sample, quotas = stratified_sample(rows, seed=seed, size=size, minimum=minimum, maximum=maximum)
-    source = manifest["source"]
-    fixture = manifest["fixture"]
+    source: dict[str, Any],
+    fixture: dict[str, Any],
+    holdout: bool,
+) -> list[dict[str, Any]]:
+    by_index = {chapter["index"]: chapter for chapter in chapters}
     enriched = []
-    for row in sample:
-        chapter = chapters[row["chapter"]]
+    for row in rows:
+        chapter = by_index[row["chapter"]]
         position = next(
             index
             for index, segment in enumerate(chapter["segments"])
@@ -189,13 +173,66 @@ def build_samples(
                 "synthetic": bool(fixture.get("synthetic")),
                 "source_language": source["language"]["source"],
                 "target_language": source["language"]["target"],
+                "holdout": holdout,
                 "reviewed": False,
-                "review_status": "suggested_not_reviewed",
+                "review_status": (
+                    "declared_holdout_not_reviewed" if holdout else "suggested_not_reviewed"
+                ),
             }
         )
+    return enriched
+
+
+def build_samples(
+    *,
+    root: Path,
+    manifest: dict[str, Any],
+    extraction: dict[str, Any],
+    limits: dict[str, Any] | None = None,
+    protocol: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    guard = PathGuard(root)
+    directory = guard.child("samples")
+    directory.mkdir(parents=True, exist_ok=True)
+    minimum = int((limits or {}).get("min") or MIN_PARAGRAPHS)
+    maximum = int((limits or {}).get("max") or MAX_PARAGRAPHS)
+    if minimum < 1 or maximum < minimum:
+        raise EvalError("Human sampling limits must satisfy 1 <= min <= max")
+    seed = int(manifest["llm"]["seed"])
+    chapters = extraction["expected"]["chapters"]
+    holdout_chapters = sorted(
+        {
+            int(value)
+            for value in (((protocol or {}).get("sampling") or {}).get("holdout") or {}).get(
+                "chapters", []
+            )
+        }
+    )
+    existing = {chapter["index"] for chapter in chapters}
+    holdout_found = [chapter for chapter in chapters if chapter["index"] in holdout_chapters]
+    main_chapters = [chapter for chapter in chapters if chapter["index"] not in holdout_chapters]
+    if not main_chapters:
+        raise SampleSizeError(0)
+    window, window_detail = select_continuous_window(main_chapters, seed=seed, minimum=minimum)
+    selected_chapters = [main_chapters[index] for index in window]
+    rows = _paragraphs(selected_chapters)
+    if len(rows) < minimum:
+        raise SampleSizeError(len(rows))
+    size = min(maximum, max(minimum, round(len(rows) * 0.8)))
+    sample, quotas = stratified_sample(rows, seed=seed, size=size, minimum=minimum, maximum=maximum)
+    source = manifest["source"]
+    fixture = manifest["fixture"]
+    enriched = _enrich_rows(
+        sample, selected_chapters, source=source, fixture=fixture, holdout=False
+    )
+    holdout_rows = _paragraphs(holdout_found)
+    holdout_enriched = _enrich_rows(
+        holdout_rows, holdout_found, source=source, fixture=fixture, holdout=True
+    )
     append_jsonl(directory / "strata.jsonl", enriched)
+    append_jsonl(directory / "holdout_strata.jsonl", holdout_enriched)
     selection = {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "created_at": utc_now(),
         "seed": seed,
         "chapter_window": window_detail,
@@ -203,6 +240,10 @@ def build_samples(
         "target_size": size,
         "selected": len(enriched),
         "strata_quotas": quotas,
+        "holdout_declared": holdout_chapters,
+        "holdout_chapters": [chapter["index"] for chapter in holdout_found],
+        "holdout_missing_chapters": sorted(set(holdout_chapters) - existing),
+        "holdout_selected": len(holdout_enriched),
         "human_review_executed": False,
         "review_status": "suggested_not_reviewed",
         "reason": (

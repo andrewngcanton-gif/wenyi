@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .common import PathGuard, read_json, utc_now, write_json_atomic
+from .gates import evaluate_gates, load_human_evidence
+from .protocol import BINDING_NAME, verify_binding
 
 
 def _value(value: Any) -> str:
@@ -21,7 +24,10 @@ def _rate(count: Any, denominator: Any) -> float | None:
 
 
 def _load_optional(path: Path) -> dict[str, Any] | None:
-    return read_json(path) if path.is_file() else None
+    data = read_json(path) if path.is_file() else None
+    if data is not None and not isinstance(data, dict):
+        raise ValueError(f"Expected an object in {path.name}")
+    return data
 
 
 def _execution_check(
@@ -87,78 +93,122 @@ def _execution_check(
     return not reasons, reasons
 
 
-def _human_decision(
-    *,
-    root: Path,
-    preregistration: dict[str, Any] | None,
-    imported: dict[str, Any] | None,
-) -> tuple[str, str]:
-    if not imported:
-        return "inconclusive", "No pairwise ratings have been imported."
-    denominator = imported.get("denominator")
-    rated = imported.get("rated_rows", 0)
-    if not isinstance(denominator, int) or denominator <= 0:
-        return "inconclusive", "Pairwise denominator is missing."
-    if rated < denominator:
-        return (
-            "inconclusive",
-            f"Only {rated} of {denominator} preregistered pairs have a preference rating; "
-            "missing ratings are not imputed.",
-        )
-    rule = (preregistration or {}).get("decision_rule")
-    if not isinstance(rule, dict):
-        return "inconclusive", "No preregistered statistical decision rule is available."
-    comparison = rule.get("comparison")
-    preferred = rule.get("preferred")
-    minimum = rule.get("min_rated")
-    threshold = rule.get("min_share")
-    if (
-        comparison not in {item["id"] for item in (preregistration or {}).get("comparisons", [])}
-        or preferred not in {"baseline", "candidate"}
-        or not isinstance(minimum, int)
-        or not isinstance(threshold, (int, float))
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _protocol_timing(
+    *, root: Path, manifest: dict[str, Any], protocol_state: dict[str, Any]
+) -> tuple[bool, list[str]]:
+    """Detect a binding produced after the manifest or after execution outputs."""
+    reasons: list[str] = []
+    binding_path = Path(root) / BINDING_NAME
+    if protocol_state.get("status") == "missing":
+        return False, reasons
+    manifest_protocol = manifest.get("protocol")
+    if not isinstance(manifest_protocol, dict) or manifest_protocol.get("status") != "valid":
+        reasons.append("the manifest does not record a frozen protocol identity")
+    elif (
+        manifest_protocol.get("content_sha256") != protocol_state.get("content_sha256")
+        or manifest_protocol.get("content_sha256") is None
     ):
-        return "inconclusive", "The preregistered decision rule is incomplete."
-    ratings_path = root / "samples" / "pairwise_ratings.jsonl"
-    key_path = root / "samples" / "pairwise_key.csv"
-    if not ratings_path.is_file() or not key_path.is_file():
-        return "inconclusive", "Imported ratings or the pairwise key are missing."
-    key = {}
-    with open(key_path, "r", encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row["comparison"] == comparison:
-                key[row["pair_id"]] = (row["left_group"], row["right_group"])
-    candidate_votes = baseline_votes = decisive = 0
-    with open(ratings_path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row["pair_id"] not in key or row["preference"] not in {"left", "right"}:
-                continue
-            left, right = key[row["pair_id"]]
-            baseline_group = next(
-                item["baseline"]
-                for item in preregistration["comparisons"]
-                if item["id"] == comparison
+        reasons.append("the manifest protocol hash differs from the frozen binding")
+    created = _parse_time(manifest.get("created_at"))
+    frozen = _parse_time(protocol_state.get("frozen_at"))
+    if created is not None and frozen is not None and frozen > created:
+        reasons.append("the protocol was frozen after the manifest was created")
+    execution_path = Path(root) / "records" / "execution.json"
+    if binding_path.is_file() and execution_path.is_file():
+        if binding_path.stat().st_mtime > execution_path.stat().st_mtime + 2:
+            reasons.append("the protocol binding was written after translation outputs")
+    data = protocol_state.get("protocol") or {}
+    groups = set((manifest.get("groups") or {}).keys())
+    for item in data.get("comparisons", []):
+        if item.get("role") != "confirmatory":
+            continue
+        if item.get("baseline") not in groups or item.get("candidate") not in groups:
+            reasons.append(f"{item.get('id')} names a group that this run did not execute")
+    sampling = data.get("sampling") or {}
+    llm = manifest.get("llm") or {}
+    if sampling.get("seed") != llm.get("seed"):
+        reasons.append("the frozen sampling seed differs from the executed seed")
+    manifest_sampling = manifest.get("sampling") or {}
+    if manifest_sampling and (
+        sampling.get("min_paragraphs") != manifest_sampling.get("min")
+        or sampling.get("max_paragraphs") != manifest_sampling.get("max")
+    ):
+        reasons.append("the frozen paragraph limits differ from the executed sampling limits")
+    return bool(reasons), reasons
+
+
+def _packet_binding_reasons(
+    *,
+    protocol_state: dict[str, Any],
+    preregistration: dict[str, Any] | None,
+    edit_preregistration: dict[str, Any] | None,
+) -> list[str]:
+    if protocol_state.get("status") != "valid":
+        return []
+    digest = protocol_state.get("content_sha256")
+    reasons: list[str] = []
+    for label, packet in (
+        ("pairwise", preregistration),
+        ("edit", edit_preregistration),
+    ):
+        if packet is None:
+            continue
+        if packet.get("protocol_content_sha256") != digest:
+            reasons.append(
+                f"the {label} packet was exported from a different protocol content hash"
             )
-            winner = left if row["preference"] == "left" else right
-            decisive += 1
-            if winner == baseline_group:
-                baseline_votes += 1
-            else:
-                candidate_votes += 1
-    if decisive < minimum:
-        return "inconclusive", f"Only {decisive} decisive ratings; {minimum} required."
-    share = candidate_votes / decisive
-    winner_is_candidate = share >= threshold
-    selected = "candidate" if winner_is_candidate else "baseline"
-    passed = selected == preferred
-    return (
-        "passed" if passed else "failed",
-        f"Preregistered rule met: {selected} share={share:.3f} (threshold {threshold}) "
-        f"over {decisive} decisive ratings.",
-    )
+    protocol = protocol_state.get("protocol") or {}
+    if preregistration:
+        exported = {item.get("id") for item in preregistration.get("comparisons", [])}
+        required = {
+            item["id"]
+            for item in protocol.get("comparisons", [])
+            if item.get("role") == "confirmatory"
+        }
+        if not required <= exported:
+            reasons.append("the pairwise packet is missing a confirmatory comparison")
+    return reasons
+
+
+def _decision_reason(
+    *,
+    conclusion: str,
+    gates: dict[str, Any],
+    manifest: dict[str, Any],
+    imported: dict[str, Any] | None,
+) -> str:
+    failed = gates.get("failed_required") or []
+    inconclusive = gates.get("inconclusive_required") or []
+    if conclusion == "passed":
+        return "Every required pre-registered gate passed on frozen non-synthetic evidence."
+    if conclusion == "failed" and failed:
+        return "Blocking gate(s) failed: " + ", ".join(failed)
+    reasons = []
+    if manifest.get("diagnostic"):
+        reasons.append(
+            "Diagnostic offline run: the external model boundary was replaced by a "
+            "deterministic adapter, so outputs and costs cannot support a quality conclusion."
+        )
+    if gates.get("protocol_status") == "missing":
+        reasons.append(
+            "No frozen experiment protocol exists; this remains a diagnostic/legacy run."
+        )
+    if not imported:
+        reasons.append("No pairwise ratings have been imported.")
+    if inconclusive:
+        reasons.append("Inconclusive required gate(s): " + ", ".join(inconclusive))
+    if not reasons:
+        reasons.append("Required evidence is incomplete; the quality claim is inconclusive.")
+    return " ".join(reasons)
 
 
 def _group_rows(
@@ -261,24 +311,76 @@ def write_report(
     guard = PathGuard(root)
     report_dir = guard.child("report")
     report_dir.mkdir(parents=True, exist_ok=True)
-    selection = _load_optional(root / "samples" / "selection.json")
-    preregistration = _load_optional(root / "samples" / "pairwise_preregistration.json")
-    imported = _load_optional(root / "samples" / "pairwise_import.json")
+    from .annotation_import import verify_imports
+
+    annotation_binding = verify_imports(root, extraction)
+    empty_evidence = {
+        kind: {"preregistration": None, "import": None, "ratings": [], "key": {}}
+        for kind in ("pairwise", "edits")
+    }
+    try:
+        selection = _load_optional(root / "samples" / "selection.json")
+        preregistration = _load_optional(root / "samples" / "pairwise_preregistration.json")
+        imported = _load_optional(root / "samples" / "pairwise_import.json")
+        edit_import = _load_optional(root / "samples" / "edit_import.json")
+        edit_preregistration = _load_optional(root / "samples" / "edit_preregistration.json")
+        evidence = (
+            load_human_evidence(root) if annotation_binding["status"] == "valid" else empty_evidence
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        annotation_binding = {
+            "status": "invalid",
+            "reason": f"Unreadable annotation evidence: {error}",
+        }
+        selection = preregistration = imported = edit_import = edit_preregistration = None
+        evidence = empty_evidence
     groups = list(manifest["groups"])
     execution_ok, execution_reasons = _execution_check(execution, extraction, groups)
+    protocol_state = verify_binding(root)
+    protocol_late, protocol_reasons = _protocol_timing(
+        root=root, manifest=manifest, protocol_state=protocol_state
+    )
+    protocol_reasons.extend(
+        _packet_binding_reasons(
+            protocol_state=protocol_state,
+            preregistration=preregistration,
+            edit_preregistration=edit_preregistration,
+        )
+    )
+    gate_result = evaluate_gates(
+        manifest=manifest,
+        extraction=extraction,
+        cost=cost,
+        execution_ok=execution_ok,
+        execution_reasons=execution_reasons,
+        protocol_state=protocol_state,
+        evidence=evidence,
+        protocol_late=protocol_late,
+        protocol_reasons=protocol_reasons,
+        selection=selection,
+        annotation_binding=annotation_binding,
+    )
     if not execution_ok:
         conclusion = "failed"
-        decision_reason = "Execution or coverage checks failed: " + "; ".join(execution_reasons)
+        scope = "execution"
+    elif gate_result["failed_required"]:
+        conclusion = "failed"
+        scope = "quality"
     elif manifest.get("diagnostic"):
         conclusion = "inconclusive"
-        decision_reason = (
-            "Diagnostic offline run: the external model boundary was replaced by a deterministic "
-            "adapter, so outputs and costs cannot support a quality conclusion."
-        )
+        scope = "diagnostic"
+    elif gate_result.get("protocol_status") == "missing":
+        conclusion = "inconclusive"
+        scope = "legacy"
     else:
-        conclusion, decision_reason = _human_decision(
-            root=root, preregistration=preregistration, imported=imported
-        )
+        conclusion = gate_result["quality_conclusion"]
+        scope = "quality"
+    decision_reason = _decision_reason(
+        conclusion=conclusion,
+        gates=gate_result,
+        manifest=manifest,
+        imported=imported,
+    )
     rows = _group_rows(manifest, extraction, execution, cost)
     _write_group_csv(report_dir / "group_summary.csv", rows)
     _write_human_csv(
@@ -286,17 +388,33 @@ def write_report(
         selection=selection,
         preregistration=preregistration,
         imported=imported,
+        edit_import=edit_import,
+        gate_result=gate_result,
         decision_reason=decision_reason,
     )
     report = {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "generated_at": utc_now(),
         "eval_id": manifest["eval_id"],
         "book": manifest["book"],
         "mode": manifest["mode"],
         "diagnostic": manifest["diagnostic"],
         "conclusion": conclusion,
+        "conclusion_scope": scope,
+        "quality_conclusion": gate_result["quality_conclusion"],
+        "empirical_evidence": gate_result["empirical_evidence"],
         "decision_reason": decision_reason,
+        "protocol": {
+            "status": protocol_state.get("status"),
+            "reason": protocol_state.get("reason"),
+            "content_sha256": protocol_state.get("content_sha256"),
+            "late_binding": protocol_late,
+            "binding_reasons": protocol_reasons,
+            "manifest": manifest.get("protocol"),
+        },
+        "gates": gate_result["gates"],
+        "failed_required_gates": gate_result["failed_required"],
+        "inconclusive_required_gates": gate_result["inconclusive_required"],
         "execution_ok": execution_ok,
         "execution_reasons": execution_reasons,
         "preparation_compatibility": execution.get("preparation_compatibility"),
@@ -327,12 +445,22 @@ def write_report(
             "sample": selection,
             "pairwise": preregistration,
             "imported": imported,
+            "edit_preregistration": edit_preregistration,
+            "edit_imported": edit_import,
+            "origin": "caller-reported, not identity-verified; not double blind",
         },
         "unknowns": manifest.get("unknowns", []),
     }
     write_json_atomic(report_dir / "report.json", report)
     markdown = _markdown(
-        manifest, report, cost, execution, extraction, selection, preregistration, imported
+        manifest,
+        report,
+        cost,
+        execution,
+        extraction,
+        selection,
+        preregistration,
+        imported,
     )
     (report_dir / "summary.md").write_text(markdown, encoding="utf-8", newline="\n")
     return report
@@ -397,6 +525,8 @@ def _write_human_csv(
     selection: dict[str, Any] | None,
     preregistration: dict[str, Any] | None,
     imported: dict[str, Any] | None,
+    edit_import: dict[str, Any] | None,
+    gate_result: dict[str, Any],
     decision_reason: str,
 ) -> None:
     fields = ["metric", "value", "denominator", "status"]
@@ -426,12 +556,35 @@ def _write_human_csv(
             "status": "missing" if imported is None else "imported",
         },
         {
+            "metric": "edited_segments",
+            "value": (edit_import or {}).get("assessed_rows"),
+            "denominator": (edit_import or {}).get("denominator"),
+            "status": "missing" if edit_import is None else "imported",
+        },
+        {
+            "metric": "quality_conclusion",
+            "value": gate_result["quality_conclusion"],
+            "denominator": "",
+            "status": "gate_result",
+        },
+    ]
+    for name, gate in gate_result.get("gates", {}).items():
+        rows.append(
+            {
+                "metric": name,
+                "value": gate.get("reason"),
+                "denominator": "",
+                "status": gate.get("status"),
+            }
+        )
+    rows.append(
+        {
             "metric": "decision",
             "value": decision_reason,
             "denominator": "",
-            "status": "inconclusive",
-        },
-    ]
+            "status": gate_result["quality_conclusion"],
+        }
+    )
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -458,25 +611,70 @@ def _markdown(
     lines = [
         f"# Wenyi evaluation {manifest['eval_id']}",
         "",
-        f"**Conclusion: {report['conclusion']}**",
+        f"**Conclusion: {report['conclusion']}** ({report['conclusion_scope']})",
         "",
         report["decision_reason"],
         "",
-        "## Identity",
+        f"- Workflow execution: {'passed' if report['execution_ok'] else 'failed'}",
+        f"- Empirical quality: {report['quality_conclusion']} "
+        f"(empirical evidence={report['empirical_evidence']})",
+        "- A workflow that ran is not a quality result; diagnostic, synthetic and offline "
+        "runs never become an empirical pass.",
         "",
-        f"- Book: `{manifest['book']}`",
-        f"- Mode: `{manifest['mode']}` (diagnostic={manifest['diagnostic']})",
-        f"- Source SHA-256: `{manifest['source']['sha256']}`",
-        f"- Fixture license: {manifest['fixture']['license']}",
-        f"- Fixture provenance: {manifest['fixture']['provenance']}",
-        f"- Seed: {manifest['llm']['seed']}",
-        f"- External provider: {manifest['llm']['external_provider']}",
-        f"- Adapter: {manifest['llm']['adapter']}",
-        f"- Price status/date: {_value(cost['price_status'])} / {_value(cost['price_date'])}",
+        "## Pre-registration",
         "",
-        "## Execution",
-        "",
+        f"- Frozen protocol: {_value((report.get('protocol') or {}).get('status'))}",
+        f"- Content SHA-256: {_value((report.get('protocol') or {}).get('content_sha256'))}",
+        f"- Late binding: {_value((report.get('protocol') or {}).get('late_binding'))}",
     ]
+    protocol_reasons = (report.get("protocol") or {}).get("binding_reasons") or []
+    if protocol_reasons:
+        lines.append("- Binding problems: " + "; ".join(protocol_reasons))
+    lines.extend(["", "## Quality gates", ""])
+    lines.extend(
+        _table(
+            ["Gate", "Required", "Status", "Evidence and reason"],
+            [
+                [
+                    name,
+                    gate.get("required"),
+                    gate.get("status"),
+                    gate.get("reason"),
+                ]
+                for name, gate in (report.get("gates") or {}).items()
+            ],
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "A blocking failure makes the quality conclusion failed; missing evidence makes it "
+            "inconclusive. Exploratory comparisons are reported but never decide the overall "
+            "pass. Only the frozen protocol defines thresholds; the code does not add hidden "
+            "defaults. Resampling happens over pre-declared clusters (whole books, chapters or "
+            "contiguous blocks), so repeated paragraphs and reruns are never treated as "
+            "independent i.i.d. observations.",
+            "",
+        ]
+    )
+    lines.extend(
+        [
+            "## Identity",
+            "",
+            f"- Book: `{manifest['book']}`",
+            f"- Mode: `{manifest['mode']}` (diagnostic={manifest['diagnostic']})",
+            f"- Source SHA-256: `{manifest['source']['sha256']}`",
+            f"- Fixture license: {manifest['fixture']['license']}",
+            f"- Fixture provenance: {manifest['fixture']['provenance']}",
+            f"- Seed: {manifest['llm']['seed']}",
+            f"- External provider: {manifest['llm']['external_provider']}",
+            f"- Adapter: {manifest['llm']['adapter']}",
+            f"- Price status/date: {_value(cost['price_status'])} / {_value(cost['price_date'])}",
+            "",
+            "## Execution",
+            "",
+        ]
+    )
     lines.extend(
         _table(
             [
@@ -692,10 +890,16 @@ def _markdown(
             f"reviewed={_value((selection or {}).get('human_review_executed'))}.",
             f"- Pairwise preregistered pairs: {_value((preregistration or {}).get('expected_pairs'))}; "
             f"rated rows: {_value((imported or {}).get('rated_rows'))}.",
+            f"- Edited segments assessed: "
+            f"{_value(((report.get('human') or {}).get('edit_imported') or {}).get('assessed_rows'))} "
+            f"of {_value(((report.get('human') or {}).get('edit_imported') or {}).get('denominator'))}.",
             "- Suggested strata and pairwise rows are not counted as human evidence. "
             "Missing ratings remain missing.",
             "- Pairwise ratings use anonymous side labels and opaque pair ids with a separate key; "
-            "this is not described as double blind.",
+            "this is not described as double blind. Human origin is caller-reported, not "
+            "identity-verified.",
+            "- MQM errors and severe flags are human annotations bound to exported text hashes; "
+            "changed outputs invalidate them.",
             "",
             "## Limitations and unknowns",
             "",
@@ -710,11 +914,13 @@ def _markdown(
             "",
             "## Artifacts",
             "",
+            "- `experiment_protocol.frozen.json` — frozen pre-registration content and hash",
             "- `manifest.json` — identities, bindings and absolute paths",
             "- `records/terminals/` — one exclusive terminal record per group and stage",
             "- `extraction.json` — expected-key aligned read-only extraction",
             "- `samples/strata.jsonl` — suggested human-review rows (unreviewed)",
             "- `samples/pairwise.csv` / `samples/pairwise_key.csv` — anonymous pairs and key",
+            "- `samples/edit_review.csv` / `samples/edit_key.csv` — blind before/after edit packet",
             "- `report/cost.json` / `report/stage_costs.csv` — operation and stage accounting",
             "- `report/group_summary.csv` / `report/human_summary.csv` — CSV summaries",
             "",
