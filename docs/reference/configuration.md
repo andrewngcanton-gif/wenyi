@@ -195,6 +195,21 @@ llm:
     reflect.body: {model: editor}
 ```
 
+This entry moves only the structured critique. Gated revision and ordinary
+polishing still use the effective `polish.body` route, and `translation.body` is
+unchanged. For a critic on another provider, define a separate connection and
+profile as in the example above; both reachable providers need credentials. The
+operation is reachable only with `pipeline.reflective_polish: true`, so configuring
+the route alone sends no request.
+
+A complete experimental, disabled-by-default example with placeholders is
+`tools/eval/examples/heterogeneous-critic.experimental.yaml`. Local
+`models list`, `models explain --operation reflect.body` and
+`models check --for translate` validate routing and credential presence, not
+remote model availability or translation quality. Quality acceptance still
+requires human scoring; see `tools/eval/FINAL_ACCEPTANCE.zh.md`.
+While reflection is disabled, the critic is excluded from credential checks.
+
 Use `wenyi models list`, `models explain --operation ID`, and
 `models check --for prepare|translate|review` for local checks.
 Only `models ping` sends live probes; see the [CLI reference](../guide/cli.md#model-commands).

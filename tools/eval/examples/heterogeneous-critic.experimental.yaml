@@ -1,0 +1,70 @@
+# EXPERIMENTAL / DRAFT configuration for a heterogeneous critic.
+#
+# This file is preparation for an experiment, not an accepted setup, a
+# recommendation for daily use, or evidence that reflective polishing improves
+# translation. No translation or quality evaluation has been run with it.
+#
+# It is an example only. It does not bundle, download, or point at any corpus,
+# and no evaluation has been executed. Supply a license-clear fixture, provider
+# credentials, and an absolute disposable state directory before use.
+#
+# Replace every placeholder before use:
+#   - YOUR_CRITIC_MODEL with a model ID served by your critic endpoint
+#   - /replace/with/absolute/disposable/state with a real disposable state path
+# Credentials stay in environment variables. Never put a key in this file.
+#
+# The draft deliberately keeps reflective polishing disabled. An isolated
+# evaluation copy may enable it for an approved experiment; daily use still
+# depends on the gates in tools/eval/FINAL_ACCEPTANCE.zh.md passing.
+#
+# Local inspection (no request is sent, no credential is printed):
+#   wenyi --config <copy> models list --json
+#   wenyi --config <copy> models explain --operation reflect.body
+#   wenyi --config <copy> models check --for translate
+# With reflection disabled, check does not validate critic credentials. For
+# offline validation only, enable reflection in an isolated copy and supply
+# dummy environment values; never run translate or models ping with that copy.
+# These check configuration and credential presence only. They cannot prove
+# that a remote model exists, that the two models are different families, or
+# that critique improves quality.
+language:
+  source: en
+  target: zh
+
+llm:
+  # Illustrative translator preset: it reads DEEPSEEK_API_KEY. If you choose
+  # another preset, use its documented environment variable. Select a critic
+  # from a different model family for a heterogeneous experiment.
+  preset: deepseek
+  providers:
+    critic_provider:
+      kind: gemini
+      api_key_env: GEMINI_API_KEY
+      timeout: 120
+      max_retries: 2
+      max_concurrency: 2
+  models:
+    critic:
+      provider: critic_provider
+      model: YOUR_CRITIC_MODEL
+      max_output_tokens: 8192
+  routes:
+    # Only the structured critique moves to this profile. The gated revision
+    # stays on the effective polish.body route, and translation.body keeps the
+    # preset route. Both reachable providers need their own credentials.
+    reflect.body: {model: critic}
+
+pipeline:
+  # Standard translation with ordinary polishing enabled.
+  translation_mode: standard
+  polish: true
+  # Off in the shipped draft; deliberate opt-in belongs in an evaluation copy.
+  reflective_polish: false
+  reflect_min_severity: major
+  # keep retains a validated clean draft and skips the extra polish call;
+  # polish continues ordinary polishing instead. Neither option promises a
+  # quality gain or a predictable cost saving.
+  reflect_clean_batches: keep
+
+paths:
+  state_dir: "/replace/with/absolute/disposable/state/heterogeneous-critic"

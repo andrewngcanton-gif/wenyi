@@ -78,7 +78,10 @@ extracted and reported, so no unrequested paid run is added.
   `--heterogeneous-reflect-model <profile>` naming a profile in the user's
   `llm.models`. The harness proves the resolved reflect and polish provider/model
   identities differ; family heterogeneity stays an operator declaration. It
-  never invents a model ID or credential.
+  never invents a model ID or credential. For a manual setup outside the harness,
+  [examples/heterogeneous-critic.experimental.yaml](examples/heterogeneous-critic.experimental.yaml)
+  is a disabled-by-default draft with placeholders; it is configuration
+  preparation, not quality acceptance.
 - `E` remains the optional three-draft reference group and is not implemented.
 
 Control and legacy groups never receive WP2-only pipeline fields or
@@ -211,7 +214,7 @@ tools/eval/
   FINAL_ACCEPTANCE.zh.md
   pyproject.toml
   variants/            # complete per-group config templates
-  examples/            # en->zh and ja->zh examples; no corpus included
+  examples/            # en->zh, ja->zh, and a disabled heterogeneous-critic draft
   wenyi_eval/
     manifest.py        # identities, explicit argv/paths, group bindings
     protocol.py        # frozen pre-registration, content hash, draft template

@@ -70,6 +70,27 @@ inspection. It is not a checkpoint: standard batches remain atomic, interrupted 
 is redone as a whole, and a missing or stale record is never treated as a clean
 batch.
 
+**Heterogeneous critic (experimental).** By default `reflect.body` inherits the
+effective `polish.body` route, so one model critiques, revises and polishes. An
+explicit `llm.routes.reflect.body` entry can move only the structured critique to
+another connection and profile. The gated revision still uses the `polish.body`
+route, and `translation.body` keeps its route. Both reachable providers need their
+own credentials. A prepared, disabled-by-default example with placeholders is
+`tools/eval/examples/heterogeneous-critic.experimental.yaml`; field semantics are
+in the [configuration reference](../reference/configuration.md).
+
+Inspect a copy locally with `wenyi --config <copy> models list --json`,
+`wenyi --config <copy> models explain --operation reflect.body` and
+`wenyi --config <copy> models check --for translate`.
+These commands read configuration and credential presence; they do not contact a
+provider, prove remote model availability or establish translation quality.
+With reflection disabled, `check` excludes critic credentials. To verify that
+boundary locally, enable reflection in an isolated copy with dummy credentials;
+do not translate with that validation copy. An approved evaluation may enable
+reflection before human scoring. Daily use still depends on all quality gates; see
+`tools/eval/FINAL_ACCEPTANCE.zh.md` and the evaluation guide `tools/eval/README.md`.
+Until those gates pass, it is not a recommendation for daily use.
+
 <a id="preparation"></a>
 
 ## Preparation before translation

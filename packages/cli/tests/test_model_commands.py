@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 import yaml
@@ -13,6 +14,7 @@ from wenyi_core.llm.operations import OPERATIONS
 from wenyi_core.llm.usage import UsageSample, UsageTracker, convert_usage_ledger, validate_usage
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?\x07|\r")
+_EXAMPLES = Path(__file__).resolve().parents[3] / "tools" / "eval" / "examples"
 
 
 def plain_text(value: str) -> str:
@@ -100,3 +102,46 @@ def test_removed_model_commands_are_not_available(tmp_path, command):
     result = _invoke(tmp_path, {}, command)
     assert result.exit_code == 2
     assert f"No such command '{command}'" in plain_text(result.output)
+
+
+def _heterogeneous_example(tmp_path) -> dict:
+    example = _EXAMPLES / "heterogeneous-critic.experimental.yaml"
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    raw["llm"]["models"]["critic"]["model"] = "test-critic-model"
+    raw["paths"]["state_dir"] = str(tmp_path / "state")
+    return raw
+
+
+def test_heterogeneous_critic_example_routes_only_the_critique(tmp_path, monkeypatch):
+    raw = _heterogeneous_example(tmp_path)
+    assert raw["pipeline"]["reflective_polish"] is False
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "dummy-test-translator-key")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    disabled = _invoke(tmp_path, raw, "check", "--for", "translate")
+    assert disabled.exit_code == 0, disabled.output
+
+    raw["pipeline"]["reflective_polish"] = True
+    listed = _invoke(tmp_path, raw, "list", "--json")
+    assert listed.exit_code == 0, listed.output
+    routes = json.loads(listed.output)
+    assert routes["reflect.body"]["origin"] == "llm.routes.reflect.body"
+    assert routes["reflect.body"]["profile"] == "critic"
+    assert routes["reflect.body"]["model"] == "test-critic-model"
+    for operation in ("translation.body", "polish.body"):
+        assert routes["reflect.body"]["model_identity"] != routes[operation]["model_identity"]
+
+    explained = _invoke(tmp_path, raw, "explain", "--operation", "reflect.body")
+    assert explained.exit_code == 0, explained.output
+    assert json.loads(explained.output)["origin"] == "llm.routes.reflect.body"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy-test-critic-key")
+    enabled = _invoke(tmp_path, raw, "check", "--for", "translate")
+    assert enabled.exit_code == 0, enabled.output
+
+    monkeypatch.delenv("GEMINI_API_KEY")
+    missing = _invoke(tmp_path, raw, "check", "--for", "translate")
+    assert missing.exit_code == 1
+    assert "GEMINI_API_KEY" in plain_text(missing.output)
+    assert "Traceback" not in missing.output

@@ -183,6 +183,18 @@ llm:
     reflect.body: {model: editor}
 ```
 
+这条路由只移动结构化批评。门控修订和普通润色仍走实际 `polish.body` 路由，
+`translation.body` 不变。若批评模型在另一提供商，像上例一样定义独立连接和模型；
+两个可达提供商都需要各自凭据。只有 `pipeline.reflective_polish: true` 时该操作
+才可达，单独配置路由不会发起请求。
+
+完整的实验性示例默认关闭、含占位符，位于
+`tools/eval/examples/heterogeneous-critic.experimental.yaml`。本地
+`models list`、`models explain --operation reflect.body` 和
+`models check --for translate` 只校验路由与凭据是否存在，不证明远端模型可用，
+也不证明译文质量。质量验收仍需人评，见 `tools/eval/FINAL_ACCEPTANCE.zh.md`。
+反思关闭时，批评模型不会纳入凭据检查。
+
 用 `wenyi models list`、`models explain --operation ID` 和
 `models check --for prepare|translate|review` 本地检查。
 只有 `models ping` 发起真实探测，详见 [CLI 命令](../guide/cli.md#model-commands)。

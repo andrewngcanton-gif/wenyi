@@ -58,6 +58,23 @@
 开启后每个批次还会在 `reflection/` 下写入一份诊断档案，供事后查看。它不是检查点：
 标准批次仍然原子提交，中断后整批重做；档案缺失或过期也绝不等于 clean。
 
+**异构批评（实验性）。** 默认情况下 `reflect.body` 继承实际 `polish.body` 路由，
+批评、修订和润色由同一模型完成。显式配置 `llm.routes.reflect.body` 可以只把
+结构化批评移到另一个连接和模型。门控修订仍走 `polish.body` 路由，
+`translation.body` 保持原路由。两个可达提供商都需要各自的凭据。仓库内有一份
+默认关闭、含占位符的示例：`tools/eval/examples/heterogeneous-critic.experimental.yaml`；
+字段含义见[配置参考](../reference/configuration.md)。
+
+复制后可用 `wenyi --config <副本> models list --json`、
+`wenyi --config <副本> models explain --operation reflect.body` 和
+`wenyi --config <副本> models check --for translate` 本地检查。
+这些命令只读取配置和凭据是否存在，不联系提供商，也不证明远端模型可用或译文质量。
+反思关闭时，`check` 不检查批评模型凭据。要验证此边界，可在隔离副本中开启反思并提供
+假凭据；不要用该校验副本翻译。经确认的质量实验可以在评分前开启反思，日常使用建议
+仍取决于全部质量门槛；验收标准见
+`tools/eval/FINAL_ACCEPTANCE.zh.md` 与评估指南 `tools/eval/README.md`。
+这些门槛通过前，它不是日常使用建议。
+
 <a id="preparation"></a>
 
 ## 翻译前的准备
