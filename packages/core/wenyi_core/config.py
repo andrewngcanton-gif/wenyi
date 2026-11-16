@@ -49,6 +49,9 @@ pipeline:
   align_retry_limit: 2
   polish: true # Polish the full translation with the strong tier; enabled by default and adds substantial cost
   translation_mode: standard # standard | three_draft_synthesis; three_draft_synthesis requires polish
+  reflective_polish: false # Critique each batch before polishing; requires polish and standard mode
+  reflect_min_severity: major # major | critical; minimum critique severity that triggers revision
+  reflect_clean_batches: polish # polish | keep; keep retains the draft for clean validated batches
   rolling_context_tokens: 512 # Recent translation budget in tokens (tiktoken cl100k_base)
   terminology_context: false # CLI-only experimental whole-book terminology evidence
   book_understanding: true # Prescan complete chapters for digests and a whole-book synopsis; disable to save prescan cost
@@ -112,6 +115,12 @@ class PipelineConfig(BaseModel):
     def validate_translation_mode(self) -> PipelineConfig:
         if self.translation_mode == "three_draft_synthesis" and not self.polish:
             raise ValueError("three_draft_synthesis translation mode requires pipeline.polish=true")
+        if self.reflective_polish and not self.polish:
+            raise ValueError("pipeline.reflective_polish requires pipeline.polish=true")
+        if self.reflective_polish and self.translation_mode == "three_draft_synthesis":
+            raise ValueError(
+                "pipeline.reflective_polish is not supported with three_draft_synthesis"
+            )
         return self
 
     review: bool = True
@@ -120,6 +129,12 @@ class PipelineConfig(BaseModel):
     polish: bool = (
         True  # Polish the full translation with the strong tier by default; disable to save cost
     )
+    # Replace ordinary polishing with a structured critique and critique-informed polish.
+    reflective_polish: bool = False
+    # Minimum critique severity that triggers critique-informed polishing.
+    reflect_min_severity: Literal["major", "critical"] = "major"
+    # polish: polish clean batches as usual; keep: keep the draft to save one call.
+    reflect_clean_batches: Literal["polish", "keep"] = "polish"
     rolling_context_tokens: int = Field(default=512, ge=0)
     # Experimental evidence production requires the CLI prepare/translate entrypoint.
     terminology_context: bool = False
@@ -308,6 +323,11 @@ class Config(BaseModel):
             return (
                 ("translator", "title_translator", "glossary_extractor", "glossary_history")
                 + (("polisher",) if self.pipeline.polish else ())
+                + (
+                    ("reflector",)
+                    if self.pipeline.polish and self.pipeline.reflective_polish
+                    else ()
+                )
                 + terminology
             )
         if phase == "review":

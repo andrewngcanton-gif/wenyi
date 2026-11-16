@@ -404,3 +404,40 @@ def test_review_rechecks_when_language_resources_change():
         ):
             orchestrator.run_review(str(source))
         assert len(client.calls) > before
+
+
+def test_reflector_templates_enter_only_the_opted_in_translation_plan():
+    from wenyi_core.agents.reflector import Reflector
+    from wenyi_core.i18n.policy.tasks import TASKS
+    from wenyi_core.llm.providers.fake import FakeClient
+
+    required = {
+        "reflector_stage_system",
+        "reflector_continue_user",
+        "reflector_revise_user",
+    }
+    assert required <= set(TASKS)
+
+    default = Config.from_dict({})
+    enabled = Config.from_dict({"pipeline": {"reflective_polish": True}})
+    default_plan = default.language_policy("translation")
+    enabled_plan = enabled.language_policy("translation")
+    default_names = set(dict(default_plan.templates))
+    enabled_names = set(dict(enabled_plan.templates))
+
+    assert not any(name.startswith("reflector_") for name in default_names)
+    assert required <= enabled_names
+    assert (
+        default_plan.fingerprint
+        == Config.from_dict({"pipeline": {"polish": True}})
+        .language_policy("translation")
+        .fingerprint
+    )
+    assert default_plan.task_fingerprint("polisher") == enabled_plan.task_fingerprint("polisher")
+
+    agent = Reflector(FakeClient(), enabled)
+    assert "[Editorial continuation]" in agent.render("reflector_stage_system")
+    continue_user = agent.render("reflector_continue_user", n=2, next_source='"(none)"')
+    revise_user = agent.render("reflector_revise_user", n=2, issues="[]", next_source='"(none)"')
+    assert "[Reflect]" in continue_user and "reviewed_segments" in continue_user
+    assert "[Revise]" in revise_user and '"polished"' in revise_user

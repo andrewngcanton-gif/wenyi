@@ -150,6 +150,7 @@ BabelDOC 配置、PDF 导出条件及其他格式要求见[格式参考](../refe
 | `--chapter N` | 翻译并保存一个从零开始编号的章节，跳过全书 Review 和导出。 |
 | `--polish` / `--no-polish` | 覆盖待译任务的 `pipeline.polish`。 |
 | `--translation-mode standard\|three_draft_synthesis` | 覆盖翻译方式；精翻要求开启润色。 |
+| `--reflective-polish` / `--no-reflective-polish` | 覆盖 `pipeline.reflective_polish`；每个批次先批评再润色。要求开启润色且使用标准模式。 |
 | `--review` / `--no-review` | 覆盖自动最终全书 Review。 |
 | `--format epub\|txt\|html\|markdown\|pdf\|docx` | 选择导出格式；PDF 仅适用于已保存的 BabelDOC 项目。 |
 | `--out PATH` | 指定单语输出路径；双语命名从此派生。 |
@@ -160,6 +161,7 @@ BabelDOC 配置、PDF 导出条件及其他格式要求见[格式参考](../refe
 ```bash
 wenyi translate book.epub --chapter 3
 wenyi translate book.epub --no-polish --no-review
+wenyi translate book.epub --reflective-polish
 wenyi translate book.epub --bilingual
 wenyi translate book.epub --no-mono --bilingual
 ```

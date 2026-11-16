@@ -23,6 +23,7 @@ OPERATION_NAMES = (
     "translation.body",
     "translation.title",
     "polish.body",
+    "reflect.body",
     "glossary.extract",
     "glossary.align_history",
     "terminology.discover",

@@ -672,3 +672,55 @@ class TestWindowsConsoleEncoding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReflectivePolishOption(unittest.TestCase):
+    @staticmethod
+    def _config(reflective=False):
+        return Config.from_dict(
+            {
+                "llm": {
+                    "preset": "fake",
+                    "models": {"default_strong": {"provider": "default", "model": "p"}},
+                },
+                "pipeline": {"polish": True, "reflective_polish": reflective},
+            }
+        )
+
+    def _run(self, args, cfg):
+        captured = {}
+
+        class FakeOrchestrator:
+            def __init__(self, config, *, allow_terminology_context=False):
+                self.client = FakeClient()
+                captured["reflective"] = config.pipeline.reflective_polish
+                captured["polish"] = config.pipeline.polish
+
+            def run_all(self, input_path, **kwargs):
+                return {"output": "out.epub", "store": FakeStore()}
+
+        with (
+            patch("wenyi_cli.commands.context.CommandContext.load_config", return_value=cfg),
+            patch("wenyi_core.pipeline.orchestrator.Orchestrator", FakeOrchestrator),
+            patch("wenyi_cli.commands.validation.os.path.isfile", return_value=True),
+        ):
+            result = CliRunner().invoke(app, ["translate", "input.txt", *args])
+        return result, captured
+
+    def test_flag_enables_reflective_polish(self):
+        result, captured = self._run(["--reflective-polish"], self._config())
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(captured["reflective"])
+
+    def test_negative_flag_overrides_config(self):
+        result, captured = self._run(["--no-reflective-polish"], self._config(True))
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse(captured["reflective"])
+
+    def test_conflicting_options_report_one_line_without_traceback(self):
+        result, captured = self._run(["--no-polish", "--reflective-polish"], self._config())
+        self.assertEqual(result.exit_code, 1)
+        output = plain_text(result.output)
+        self.assertIn("reflective_polish requires pipeline.polish=true", output)
+        self.assertNotIn("Traceback", output)
+        self.assertEqual(captured, {})

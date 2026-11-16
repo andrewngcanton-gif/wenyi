@@ -303,6 +303,7 @@ const zhCN = {
   "accounting.bookSynopsis": "全书概要",
   "accounting.translateTitles": "标题翻译",
   "accounting.alignTerms": "历史术语对齐",
+  "accounting.prePolishCritique": "润色前批评",
   "accounting.reviewScan": "审校扫描",
   "accounting.reviewVerify": "审校证据核验",
   "accounting.reviewArbitrate": "审校冲突裁决",

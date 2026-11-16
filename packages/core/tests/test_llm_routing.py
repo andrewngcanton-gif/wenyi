@@ -655,3 +655,44 @@ def test_route_rejects_ambiguous_selection():
                 }
             }
         )
+
+
+def test_reflect_body_inherits_the_polish_route_and_can_be_overridden():
+    from wenyi_core.config import Config
+    from wenyi_core.llm.routing import resolve_routes
+
+    config = Config.from_dict({"llm": {"preset": "deepseek"}})
+    routes = resolve_routes(config.llm)
+    assert routes["reflect.body"].profile == routes["polish.body"].profile
+    assert routes["reflect.body"].model == routes["polish.body"].model
+    assert routes["reflect.body"].tier == routes["polish.body"].tier
+    assert routes["reflect.body"].origin == "inherits polish.body"
+
+    overridden = Config.from_dict(
+        {
+            "llm": {
+                "preset": "deepseek",
+                "models": {"critic": {"provider": "default", "model": "critic-model"}},
+                "routes": {"reflect.body": {"model": "critic"}},
+            }
+        }
+    )
+    routes = resolve_routes(overridden.llm)
+    assert routes["reflect.body"].profile == "critic"
+    assert routes["reflect.body"].model == "critic-model"
+    assert routes["reflect.body"].fingerprint != routes["polish.body"].fingerprint
+
+
+def test_configured_operations_include_reflect_body_only_when_enabled():
+    from wenyi_core.config import Config
+    from wenyi_core.llm.operations import configured_operations
+
+    disabled = Config.from_dict({"llm": {"preset": "fake"}})
+    enabled = Config.from_dict({"llm": {"preset": "fake"}, "pipeline": {"reflective_polish": True}})
+    unpolished = Config.from_dict({"llm": {"preset": "fake"}, "pipeline": {"polish": False}})
+
+    assert "reflect.body" not in configured_operations(disabled, "translate")
+    assert "polish.body" in configured_operations(disabled, "translate")
+    assert "reflect.body" in configured_operations(enabled, "translate")
+    assert "reflect.body" not in configured_operations(unpolished, "translate")
+    assert "reflect.body" not in configured_operations(enabled, "prepare")

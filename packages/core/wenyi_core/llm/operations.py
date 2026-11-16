@@ -97,6 +97,13 @@ OPERATIONS = register_operations(
             flags=("polish",),
             protocol_version=2,
         ),
+        OperationSpec(
+            "reflect.body",
+            "Critique translated paragraphs before polishing",
+            inherits="polish.body",
+            flags=("polish", "reflective_polish"),
+            protocol_version=2,
+        ),
         OperationSpec("glossary.extract", "Extract glossary candidates", "fast"),
         OperationSpec("glossary.align_history", "Align terms with earlier translations", "fast"),
         OperationSpec(

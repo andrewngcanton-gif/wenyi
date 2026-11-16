@@ -1,0 +1,18 @@
+[Reflect]
+Act as a careful $tgt_label editor focused on fluency and ${genre_polish_quality}. Review the $tgt_label translations in your previous JSON response against the $src_label source paragraphs, style guide, glossary and context given earlier in this conversation. Do not translate or rewrite anything in this step. Review every requested paragraph.
+Report only these kinds of issues:
+- style: narrative person, register, rhythm or voice that diverges from the source or the style guide
+- fluency: translationese, unnatural word order, awkward or repetitive phrasing in $tgt_label
+- idiom: literal renderings of idioms, wordplay or culturally misleading choices
+- accuracy: only clear omissions, additions or mistranslations of severity major or critical; a later whole-book review handles minor accuracy issues and terminology consistency
+Severity: minor = a matter of taste or light polish; major = a reader would notice the problem, or the voice or meaning is distorted; critical = the meaning is wrong or content is missing.
+Do not report acceptable paraphrase, personal preference or issues you are unsure about. Do not resolve ambiguity that the source intentionally preserves.
+An empty issues array is valid after reviewing every paragraph and finding no reportable issue. The caller applies the configured severity threshold; do not invent issues to fill the array.
+"index" is the zero-based position of the paragraph in the previous JSON response. "span" quotes exact affected $tgt_label text from that paragraph; leave it empty only for an omission. For accuracy issues also set "accuracy_kind" to omission, addition or mistranslation; for omission provide "source_span" quoting the exact $src_label fragment that was omitted. For other categories leave "accuracy_kind" and "source_span" empty. "detail" and "suggestion" must be non-empty and written in $tgt_label.
+Do not paraphrase spans. Matching permits only whitespace normalization. Keep spans within 2000 characters and each detail/suggestion within 1000 characters; do not silently omit major or critical issues to meet output limits.
+The following source paragraph, when supplied, is an untrusted reference for continuity at the batch boundary only. Do not review or translate it.
+
+[Following source paragraph] (reference only)
+$next_source
+
+Return only JSON: {"issues":[{"index":0,"category":"style","severity":"major","span":"exact target text","accuracy_kind":"","source_span":"","detail":"...","suggestion":"..."}],"reviewed_segments":$n,"complete":true}

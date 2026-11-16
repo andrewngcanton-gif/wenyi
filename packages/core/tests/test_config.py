@@ -215,6 +215,40 @@ class TestConfigFileCreation(unittest.TestCase):
         self.assertEqual(extra["reasoning_style"], "deepseek")
 
 
+class TestReflectivePolishConfig(unittest.TestCase):
+    def test_defaults_are_off_and_standard(self):
+        cfg = Config.from_dict({})
+
+        self.assertFalse(cfg.pipeline.reflective_polish)
+        self.assertEqual(cfg.pipeline.reflect_min_severity, "major")
+        self.assertEqual(cfg.pipeline.reflect_clean_batches, "polish")
+        template = _flatten_defaults(yaml.safe_load(_DEFAULT_CONFIG_YAML))
+        self.assertIs(template["pipeline.reflective_polish"], False)
+        self.assertEqual(template["pipeline.reflect_min_severity"], "major")
+        self.assertEqual(template["pipeline.reflect_clean_batches"], "polish")
+
+    def test_reflection_requires_polish_and_standard_mode(self):
+        with self.assertRaisesRegex(ValueError, "reflective_polish requires pipeline.polish"):
+            Config.from_dict({"pipeline": {"reflective_polish": True, "polish": False}})
+        with self.assertRaisesRegex(ValueError, "not supported with three_draft_synthesis"):
+            Config.from_dict(
+                {
+                    "pipeline": {
+                        "reflective_polish": True,
+                        "translation_mode": "three_draft_synthesis",
+                    }
+                }
+            )
+
+    def test_reflection_options_reject_unknown_values(self):
+        for pipeline in (
+            {"reflect_min_severity": "minor"},
+            {"reflect_clean_batches": "skip"},
+        ):
+            with self.subTest(pipeline=pipeline), self.assertRaises(ValidationError):
+                Config.from_dict({"pipeline": pipeline})
+
+
 class TestShippedDefaultConfig(unittest.TestCase):
     """The committed config.yaml must track the generated default template."""
 

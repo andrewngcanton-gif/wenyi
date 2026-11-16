@@ -36,6 +36,7 @@ const operations: Record<string, MessageKey> = {
   "translation.body": "workflow.translate",
   "translation.title": "accounting.translateTitles",
   "polish.body": "settings.polishing",
+  "reflect.body": "accounting.prePolishCritique",
   "glossary.extract": "workflow.terms",
   "glossary.align_history": "accounting.alignTerms",
   "annotation.align": "settings.paragraphAnnotationAlignment",

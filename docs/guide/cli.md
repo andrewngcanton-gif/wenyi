@@ -167,6 +167,7 @@ Options not supplied on the command line retain their YAML values.
 | `--chapter N` | Translate and save one zero-based chapter; skip whole-book Review and export. |
 | `--polish` / `--no-polish` | Override `pipeline.polish` for pending translation work. |
 | `--translation-mode standard\|three_draft_synthesis` | Override the translation method; precision requires polishing. |
+| `--reflective-polish` / `--no-reflective-polish` | Override `pipeline.reflective_polish`; critique each batch before polishing. Requires polishing and standard mode. |
 | `--review` / `--no-review` | Override automatic final whole-book Review. |
 | `--format epub\|txt\|html\|markdown\|pdf\|docx` | Choose an export format; PDF is only available for saved BabelDOC projects. |
 | `--out PATH` | Set the monolingual output path; bilingual naming is derived from it. |
@@ -177,6 +178,7 @@ Options not supplied on the command line retain their YAML values.
 ```bash
 wenyi translate book.epub --chapter 3
 wenyi translate book.epub --no-polish --no-review
+wenyi translate book.epub --reflective-polish
 wenyi translate book.epub --bilingual
 wenyi translate book.epub --no-mono --bilingual
 ```

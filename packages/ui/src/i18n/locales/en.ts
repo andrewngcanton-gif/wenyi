@@ -313,6 +313,7 @@ const en = {
   "accounting.bookSynopsis": "Book synopsis",
   "accounting.translateTitles": "Title translation",
   "accounting.alignTerms": "Align earlier terms",
+  "accounting.prePolishCritique": "Pre-polish critique",
   "accounting.reviewScan": "Review scan",
   "accounting.reviewVerify": "Verify review evidence",
   "accounting.reviewArbitrate": "Resolve review conflicts",

@@ -306,3 +306,168 @@ class TestTranslationService(unittest.TestCase):
                     ]
                 ],
             )
+
+
+# ── Reflective polish service integration ────────────────────────────────────────
+
+
+def _pending_reflection_store(tmp_path):
+    from tests.review_fixtures import autofix_store as _store
+
+    store = _store(str(tmp_path))
+    manifest = store.load_manifest()
+    manifest["chapters"][0]["status"] = "pending"
+    store.save_manifest(manifest)
+    chapter = store.load_chapter(0)
+    for segment in chapter.segments:
+        segment.target = None
+        segment.target_before_polish = None
+    store.save_chapter(chapter)
+    return store
+
+
+def _reflection_config(tmp_path, *, enabled=True):
+    from tests.review_fixtures import autofix_config as _config
+
+    config = _config(str(tmp_path / "state"))
+    config.pipeline.review_autofix = False
+    config.pipeline.annotation_alignment = False
+    config.pipeline.align_retry_limit = 0
+    config.pipeline.reflective_polish = enabled
+    return config
+
+
+def _reflection_handler(critique=None, revise=None):
+    from tests.fake_llm import routing_handler
+
+    def handler(messages, tier, json_mode):
+        user = messages[-1]["content"]
+        if "[Reflect]" in user:
+            if isinstance(critique, BaseException):
+                raise critique
+            return critique or '{"issues":[],"reviewed_segments":1,"complete":true}'
+        if "[Revise]" in user:
+            if isinstance(revise, BaseException):
+                raise revise
+            return revise
+        return routing_handler(messages, tier, json_mode)
+
+    return handler
+
+
+def _batch_events(store):
+    return [event for event in store.list_events(limit=0) if event["event"] == "batch_translated"]
+
+
+def test_service_writes_reflection_artifact_and_event(tmp_path):
+    from wenyi_core.i18n.policy.models import content_hash
+    from wenyi_core.pipeline.translate.reflection_records import reflection_artifact_key
+
+    store = _pending_reflection_store(tmp_path)
+    config = _reflection_config(tmp_path)
+    client = FakeClient(handler=_reflection_handler())
+    Orchestrator(config, client)._translation.run(store, book_synopsis="")
+
+    assert store.load_chapter(0).text_segments[0].target == "润0"
+    record = store.read_artifact(reflection_artifact_key(0, 0, 1))
+    assert record["schema"] == 1
+    assert record["critique"] == "validated_clean"
+    assert record["adoption"] == "ordinary_polished"
+    assert record["source_sha256"] == "0" * 64
+    assert record["targets"]["segments"][0]["sha256"] == content_hash("润0")
+    assert [call["operation"] for call in client.calls][:3] == [
+        "translation.body",
+        "reflect.body",
+        "polish.body",
+    ]
+    events = _batch_events(store)
+    assert len(events) == 1
+    assert events[0]["reflection"]["critique"] == "validated_clean"
+    assert events[0]["reflection"]["artifact_status"] == "written"
+
+
+def test_disabled_reflection_writes_no_artifact_or_event_summary(tmp_path):
+    store = _pending_reflection_store(tmp_path)
+    config = _reflection_config(tmp_path, enabled=False)
+    client = FakeClient(handler=_reflection_handler())
+    Orchestrator(config, client)._translation.run(store, book_synopsis="")
+
+    assert store.list_artifacts("reflection/") == []
+    assert "reflect.body" not in [call["operation"] for call in client.calls]
+    events = _batch_events(store)
+    assert len(events) == 1 and "reflection" not in events[0]
+
+
+def test_resume_skips_completed_batches_without_reflection(tmp_path):
+    from wenyi_core.storage.run_store import STATUS_PENDING
+
+    store = _pending_reflection_store(tmp_path)
+    config = _reflection_config(tmp_path)
+    Orchestrator(config, FakeClient(handler=_reflection_handler()))._translation.run(
+        store, book_synopsis=""
+    )
+    first_batches = len(_batch_events(store))
+    store.set_chapter_status(0, STATUS_PENDING)
+    resumed = FakeClient(handler=_reflection_handler())
+    Orchestrator(config, resumed)._translation.run(store, book_synopsis="")
+
+    assert "reflect.body" not in [call["operation"] for call in resumed.calls]
+    assert store.load_chapter(0).text_segments[0].target == "润0"
+    assert len(_batch_events(store)) == first_batches
+
+
+def test_artifact_write_failure_keeps_saved_text_and_event(tmp_path, monkeypatch):
+    store = _pending_reflection_store(tmp_path)
+    config = _reflection_config(tmp_path)
+    original = store.write_artifact
+
+    def failing(key, value):
+        if key.startswith("reflection/"):
+            raise OSError("disk full")
+        return original(key, value)
+
+    monkeypatch.setattr(store, "write_artifact", failing)
+    Orchestrator(config, FakeClient(handler=_reflection_handler()))._translation.run(
+        store, book_synopsis=""
+    )
+
+    assert store.load_chapter(0).text_segments[0].target == "润0"
+    events = _batch_events(store)
+    assert events[0]["reflection"]["artifact_status"] == "write_failed"
+    assert store.list_artifacts("reflection/") == []
+
+
+def test_save_chapter_failure_propagates_without_artifact(tmp_path, monkeypatch):
+    store = _pending_reflection_store(tmp_path)
+    config = _reflection_config(tmp_path)
+
+    def failing(chapter):
+        raise OSError("cannot save")
+
+    monkeypatch.setattr(store, "save_chapter", failing)
+    with pytest.raises(OSError):
+        Orchestrator(config, FakeClient(handler=_reflection_handler()))._translation.run(
+            store, book_synopsis=""
+        )
+    assert store.list_artifacts("reflection/") == []
+
+
+def test_artifact_stop_propagates_after_the_batch_is_saved(tmp_path, monkeypatch):
+    from wenyi_core.llm.limits import RequestStopped
+
+    store = _pending_reflection_store(tmp_path)
+    config = _reflection_config(tmp_path)
+    original = store.write_artifact
+
+    def stopping(key, value):
+        if key.startswith("reflection/"):
+            raise RequestStopped()
+        return original(key, value)
+
+    monkeypatch.setattr(store, "write_artifact", stopping)
+    with pytest.raises(RequestStopped):
+        Orchestrator(config, FakeClient(handler=_reflection_handler()))._translation.run(
+            store, book_synopsis=""
+        )
+    assert store.load_chapter(0).text_segments[0].target == "润0"
+    assert store.list_artifacts("reflection/") == []

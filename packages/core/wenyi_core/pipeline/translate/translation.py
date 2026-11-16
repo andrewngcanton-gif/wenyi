@@ -11,6 +11,7 @@ overwriting targets.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,7 @@ from ...agents.glossary_extractor import TranslatedSegmentEvidence
 from ...config import PipelineConfig
 from ...events import ProgressFn
 from ...glossary.store import GlossaryStore
+from ...llm.routing import resolve_routes
 from ...markup.contexts import annotation_contexts_for_segments
 from ...models.document import Chapter, Segment
 from ...storage.protocol import Storage
@@ -27,13 +29,26 @@ from ..annotate.docx_styles import DocxStyleService
 from .babeldoc_context import BabeldocContext
 from .context import render_recent_translations
 from .precision import PrecisionBatchExecutor, PrecisionError
+from .reflection_records import (
+    CODE_IDENTITY,
+    build_reflection_record,
+    reflection_artifact_key,
+)
 from .terminology import TerminologyService
 from .title_translation import TitleTranslationService
-from .translation_batch import BatchPlan, BatchResult, TranslationBatchExecutor, resume_batches
+from .translation_batch import (
+    BatchPlan,
+    BatchResult,
+    ReflectivePolicy,
+    TranslationBatchExecutor,
+    resume_batches,
+)
 
 if TYPE_CHECKING:
     from ..annotate.annotations import AnnotationService
     from ..run.runtime import PipelineRuntime
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _is_mineru_pdf(manifest: dict[str, Any]) -> bool:
@@ -45,6 +60,28 @@ def _is_mineru_pdf(manifest: dict[str, Any]) -> bool:
     return not bool(meta.get("babeldoc")) and meta.get("pdf_export") != "babeldoc"
 
 
+def _observed_request_collector(calls: list[dict[str, Any]]):
+    """Collect scheduled request identities for the current batch only."""
+
+    def observe(event: str, **data: Any) -> None:
+        if event != "llm_request_started":
+            return
+        calls.append(
+            {
+                "call_id": data.get("call_id"),
+                "operation": data.get("operation"),
+                "profile": data.get("profile"),
+                "model": data.get("model"),
+                "provider": data.get("provider"),
+                "tier": data.get("tier"),
+                "inference_fingerprint": data.get("inference_fingerprint"),
+                "attempt": data.get("attempt"),
+            }
+        )
+
+    return observe
+
+
 class TranslationService:
     """Domain service for body translation, glossary extraction and chapter/TOC titles."""
 
@@ -53,7 +90,9 @@ class TranslationService:
         self._annotations = annotations
         self._docx_styles = DocxStyleService(runtime)
         self._titles = TitleTranslationService(runtime.title_translator)
-        self._batches = TranslationBatchExecutor(runtime.translator, runtime.polisher)
+        self._batches = TranslationBatchExecutor(
+            runtime.translator, runtime.polisher, runtime.reflector
+        )
         self._precision = PrecisionBatchExecutor(runtime.client, runtime.config)
 
     def run(
@@ -74,6 +113,7 @@ class TranslationService:
         glossary = store
         style = self._runtime.analyzer.style_brief(store.load_analysis() or {})
         allow_empty_translations = _is_mineru_pdf(manifest)
+        source_identity = manifest.get("source_sha256", "")
 
         if only_chapter is not None:
             targets = [only_chapter]
@@ -118,6 +158,9 @@ class TranslationService:
                     total=total,
                     allow_empty_translations=allow_empty_translations,
                     terminology=terminology,
+                    source_identity=source_identity,
+                    source_language=self._runtime.config.source_lang,
+                    target_language=self._runtime.config.target_lang,
                 )
                 self._runtime.usage.flush(store, scope="chapter")
             # Translate chapter/TOC titles after the body; keep the original book title and use glossary names.
@@ -233,6 +276,9 @@ class TranslationService:
         total: int = 0,
         allow_empty_translations: bool = False,
         terminology: TerminologyService | None = None,
+        source_identity: str = "",
+        source_language: str = "",
+        target_language: str = "",
     ) -> int:
         """Translate, polish, extract and persist one chapter; return the updated
         completed-paragraph count.
@@ -266,6 +312,9 @@ class TranslationService:
         # still extract and mark the snapshot stale, preserving resume completeness without redundant reads.
         term_snapshot = glossary.all_terms()
         term_snapshot_stale = False
+        reflective = self._reflective_policy()
+        reflection_identity = self._reflection_policy_identity() if reflective is not None else None
+        configured_routes = self._configured_reflection_routes() if reflective is not None else {}
 
         # Process batches serially, deriving context from the latest formal targets.
         # This preserves pronoun, term and voice continuity between batches within a chapter.
@@ -388,21 +437,69 @@ class TranslationService:
                 b = text_segs[batch_start : batch_start + len(b)]
                 self._precision.mark_published(store, result)
             else:
-                result = self._batches.execute(plan, polish=self._runtime.config.pipeline.polish)
+                observed_calls: list[dict[str, Any]] = []
+                if reflective is None:
+                    result = self._batches.execute(
+                        plan, polish=self._runtime.config.pipeline.polish
+                    )
+                else:
+                    with self._runtime.client.capture_events(
+                        _observed_request_collector(observed_calls)
+                    ):
+                        result = self._batches.execute(
+                            plan,
+                            polish=self._runtime.config.pipeline.polish,
+                            reflective=reflective,
+                        )
                 for segment, target, before_polish in zip(b, result.targets, result.before_polish):
                     segment.target = target
                     segment.target_before_polish = before_polish
                 # Persist translations incrementally so interruption resumes after this batch.
                 store.save_chapter(chapter)
             self._align_batch_context(store, chapter, batch_start, len(b))
-            store.log_event(
-                "batch_translated",
-                chapter=ci,
-                start_index=batch_start,
-                count=len(b),
-                polished=self._runtime.config.pipeline.polish,
-                translation_mode=self._runtime.config.pipeline.translation_mode,
-                segments=[
+            artifact_status = "not_written"
+            if reflective is not None and result.reflection is not None:
+                formal_segments = chapter.text_segments[
+                    batch_start : batch_start + len(plan.segment_indices)
+                ]
+                record = build_reflection_record(
+                    chapter=ci,
+                    start_index=batch_start,
+                    segment_indices=plan.segment_indices,
+                    sources=plan.sources,
+                    source_sha256=source_identity,
+                    source_language=source_language,
+                    target_language=target_language,
+                    outcome=result.reflection,
+                    raw_drafts=result.raw_drafts,
+                    positions=result.reflection.positions,
+                    executor_targets=result.targets,
+                    executor_before_polish=result.before_polish,
+                    formal_segments=formal_segments,
+                    policy=reflection_identity or {},
+                    configured_routes=configured_routes,
+                    observed_calls=observed_calls,
+                )
+                key = reflection_artifact_key(ci, batch_start, len(plan.segment_indices))
+                # Only the diagnostic write is fault-tolerant; formal saves and events are not.
+                try:
+                    store.write_artifact(key, record)
+                except Exception as error:  # noqa: BLE001 - Diagnostic storage must not break a saved batch.
+                    artifact_status = "write_failed"
+                    _LOGGER.warning(
+                        "Cannot write reflection artifact (key=%s, error=%s)",
+                        key,
+                        type(error).__name__,
+                    )
+                else:
+                    artifact_status = "written"
+            batch_event: dict[str, Any] = {
+                "chapter": ci,
+                "start_index": batch_start,
+                "count": len(b),
+                "polished": self._runtime.config.pipeline.polish,
+                "translation_mode": self._runtime.config.pipeline.translation_mode,
+                "segments": [
                     {
                         "index": batch_start + i,
                         "source": s.source,
@@ -410,7 +507,13 @@ class TranslationService:
                     }
                     for i, s in enumerate(b)
                 ],
-            )
+            }
+            if reflective is not None and result.reflection is not None:
+                batch_event["reflection"] = {
+                    **result.reflection.summary(),
+                    "artifact_status": artifact_status,
+                }
+            store.log_event("batch_translated", **batch_event)
             done += len(b)
             seg_base += len(b)
             if progress:
@@ -459,6 +562,46 @@ class TranslationService:
             segment_count=len(text_segs),
         )
         return done
+
+    def _reflective_policy(self) -> ReflectivePolicy | None:
+        """Reflection replaces ordinary polish only in the standard translation mode."""
+        pipeline = self._runtime.config.pipeline
+        if pipeline.translation_mode != "standard":
+            return None
+        if not (pipeline.polish and pipeline.reflective_polish):
+            return None
+        return ReflectivePolicy(
+            min_severity=pipeline.reflect_min_severity,
+            clean_action=pipeline.reflect_clean_batches,
+        )
+
+    def _reflection_policy_identity(self) -> dict[str, Any]:
+        """Describe the frozen template and policy identity used for this chapter."""
+        plan = self._runtime.config.language_policy("translation")
+        pipeline = self._runtime.config.pipeline
+        return {
+            "code_identity": CODE_IDENTITY,
+            "reflective_polish": True,
+            "min_severity": pipeline.reflect_min_severity,
+            "clean_action": pipeline.reflect_clean_batches,
+            "reflector_fingerprint": plan.task_fingerprint("reflector"),
+            "translation_fingerprint": plan.fingerprint,
+        }
+
+    def _configured_reflection_routes(self) -> dict[str, dict[str, Any]]:
+        """Record configured route identities; actual requests are observed separately."""
+        routes = resolve_routes(self._runtime.llm_config)
+        return {
+            operation: {
+                "profile": routes[operation].profile,
+                "model": routes[operation].model,
+                "provider": routes[operation].provider,
+                "inference_fingerprint": routes[operation].fingerprint,
+                "max_output_tokens": routes[operation].max_output_tokens,
+                "fallbacks": list(routes[operation].fallbacks),
+            }
+            for operation in ("reflect.body", "polish.body", "translation.body")
+        }
 
     def _align_batch_context(
         self,

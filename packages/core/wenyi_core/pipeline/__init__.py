@@ -71,6 +71,7 @@ from .translate import (
     context,  # noqa: F401
     precision,  # noqa: F401
     precision_records,  # noqa: F401
+    reflection_records,  # noqa: F401
     terminology,  # noqa: F401
     terminology_metadata,  # noqa: F401
     title_translation,  # noqa: F401
@@ -95,6 +96,7 @@ __all__ = [
     "babeldoc_context",
     "precision",
     "precision_records",
+    "reflection_records",
     "annotations",
     "docx_styles",
     "review_workflow",

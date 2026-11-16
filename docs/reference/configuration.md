@@ -187,6 +187,14 @@ llm:
 
 Replace the model placeholder with one supported by the endpoint.
 `autofix.verify` inherits the effective `review.verify` route unless overridden.
+`reflect.body` inherits the effective `polish.body` route unless overridden:
+
+```yaml
+llm:
+  routes:
+    reflect.body: {model: editor}
+```
+
 Use `wenyi models list`, `models explain --operation ID`, and
 `models check --for prepare|translate|review` for local checks.
 Only `models ping` sends live probes; see the [CLI reference](../guide/cli.md#model-commands).
@@ -271,6 +279,7 @@ its stage is disabled; reachable checks follow the selected workflow switches.
 | `translation.body` | `strong` | Body translation, including precision drafts |
 | `translation.title` | `strong` | Chapter and TOC titles |
 | `polish.body` | `strong` | Polishing, including precision synthesis |
+| `reflect.body` | inherits `polish.body` | Structured critique before reflective polishing; reachable only with `pipeline.reflective_polish` |
 | `glossary.extract` | `fast` | Glossary extraction |
 | `glossary.align_history` | `fast` | Earlier translation alignment |
 | `terminology.discover` | `strong` | Source-grounded person discovery |
@@ -372,6 +381,9 @@ described under [scope](#scope).
 |---|---|---|
 | `pipeline.translation_mode` | `standard` | `standard` or `three_draft_synthesis`; the latter requires `polish: true`. |
 | `pipeline.polish` | `true` | Polish translated batches; adds substantial model work. |
+| `pipeline.reflective_polish` | `false` | Replace ordinary polishing with a structured critique and a gated revision; requires `polish: true` and standard mode. |
+| `pipeline.reflect_min_severity` | `major` | `major` or `critical`; the minimum critique severity that triggers a revision request. |
+| `pipeline.reflect_clean_batches` | `polish` | `polish` or `keep`; for a validated clean batch, continue ordinary polishing or keep the draft without another call. |
 | `pipeline.align_retry_limit` | `2` | Additional structural-output attempts; `0` disables them. |
 | `pipeline.rolling_context_tokens` | `512` | Preceding translation budget, integer ≥ 0, counted with `cl100k_base`. |
 | `pipeline.book_understanding` | `true` | Generate full-source chapter digests and a book synopsis. |
@@ -389,6 +401,16 @@ with polishing. Three-draft concurrency is built in, not a user setting.
 Keep the mode/configuration consistent to reuse checkpoints. Structural retry
 exhaustion pauses precision work without paragraph splitting; standard translation
 can fall back to individual paragraphs. Retries also consume usage.
+
+`reflective_polish` is available only in `standard` mode with polishing enabled.
+A batch that receives a complete, valid critique with no issue at or above
+`reflect_min_severity` is **validated clean**; `reflect_clean_batches` then either
+continues ordinary polishing or, with `keep`, saves the draft without a second call.
+At or above the threshold, only the validated issues are sent with a revision
+request. An invalid, partial or failed critique never counts as clean: the batch
+falls back to ordinary polishing, then to the standalone polish path. The extra
+critique and revision requests are billed even when they fail. Reflective polishing
+is a quality experiment, not a promise of better output.
 
 Rolling context selects the newest contiguous translations that fit, including
 newline separators; an oversized newest paragraph contributes a Unicode-safe tail.
@@ -456,7 +478,9 @@ Matching content, Review configuration/model identity, guidance, and glossary
 allow reuse or resume; Review does not always start a new timestamped run.
 
 `translate --polish/--no-polish` and `--review/--no-review` override their
-respective fields. `translate` has no `--no-autofix` flag: use YAML to keep its
+respective fields. `translate --reflective-polish/--no-reflective-polish` overrides
+`pipeline.reflective_polish`; enabling it together with `--no-polish`, or with
+`three_draft_synthesis`, is rejected. `translate` has no `--no-autofix` flag: use YAML to keep its
 automatic Review from starting new publication, or skip that Review and run the
 standalone command with `--no-autofix`. See [Review and Autofix](../guide/pipeline.md#review-and-autofix).
 

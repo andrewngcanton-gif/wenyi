@@ -175,7 +175,14 @@ llm:
 ```
 
 把模型占位符替换成端点支持的模型。未覆盖时，`autofix.verify`
-继承实际 `review.verify` 路由。
+继承实际 `review.verify` 路由，`reflect.body` 继承实际 `polish.body` 路由：
+
+```yaml
+llm:
+  routes:
+    reflect.body: {model: editor}
+```
+
 用 `wenyi models list`、`models explain --operation ID` 和
 `models check --for prepare|translate|review` 本地检查。
 只有 `models ping` 发起真实探测，详见 [CLI 命令](../guide/cli.md#model-commands)。
@@ -257,6 +264,7 @@ BabelDOC 是独立 HTTP 服务。
 | `translation.body` | `strong` | 正文翻译，包括精翻初稿 |
 | `translation.title` | `strong` | 章节与目录标题 |
 | `polish.body` | `strong` | 润色，包括精翻综合 |
+| `reflect.body` | 继承 `polish.body` | 反思式润色前的结构化批评；仅在 `pipeline.reflective_polish` 开启时可达 |
 | `glossary.extract` | `fast` | 术语抽取 |
 | `glossary.align_history` | `fast` | 历史译法对齐 |
 | `terminology.discover` | `strong` | 基于原文的人物发现 |
@@ -353,6 +361,9 @@ CLI 只覆盖其参数明确支持的设置；Web/Desktop 项目限制见[作用
 |---|---|---|
 | `pipeline.translation_mode` | `standard` | `standard` 或 `three_draft_synthesis`，后者要求 `polish: true`。 |
 | `pipeline.polish` | `true` | 润色已译批次，增加较多模型工作。 |
+| `pipeline.reflective_polish` | `false` | 用结构化批评加门控修订替代普通润色；要求 `polish: true` 且为标准模式。 |
+| `pipeline.reflect_min_severity` | `major` | `major` 或 `critical`；触发修订请求的最低批评严重度。 |
+| `pipeline.reflect_clean_batches` | `polish` | `polish` 或 `keep`；校验通过且无达标问题时继续普通润色，或不再请求、保留初译。 |
 | `pipeline.align_retry_limit` | `2` | 额外结构输出尝试次数；`0` 关闭。 |
 | `pipeline.rolling_context_tokens` | `512` | 前文译文预算，整数 ≥ 0，按 `cl100k_base` 计数。 |
 | `pipeline.book_understanding` | `true` | 生成覆盖完整原文的章节梗概和全书概览。 |
@@ -368,6 +379,13 @@ CLI 只覆盖其参数明确支持的设置；Web/Desktop 项目限制见[作用
 正常批次四次调用，标准翻译加润色为两次。三稿并发是内置行为，不是用户设置。
 保留相同模式／配置才能复用检查点。结构重试耗尽时精翻暂停，不自动拆段；
 标准翻译可以回退到逐段请求。重试也产生用量。
+
+`reflective_polish` 只在 `standard` 模式且开启润色时可用。批评回执完整、通过校验，
+且没有达到 `reflect_min_severity` 的问题时，该批次为**校验后 clean**；
+`reflect_clean_batches` 决定继续普通润色，还是用 `keep` 保留初译、不再调用模型。
+存在达标问题时，只把通过校验的意见随修订请求发送。批评无效、不完整或请求失败
+**绝不**当作 clean：批次回退普通润色，再回退独立润色。批评和修订请求即使失败也计费。
+反思式润色是质量实验，不承诺译文必然更好。
 
 滚动上下文选取预算内最近的连续译文，包含段间换行；
 最近一段单独超限时，截取不破坏 Unicode 的尾部。
@@ -428,6 +446,9 @@ Autofix 发布折叠后的 Review 修订，并可对更新后的文本核查、�
 不是每次都新建时间戳目录。
 
 `translate --polish/--no-polish` 和 `--review/--no-review` 覆盖对应设置。
+`translate --reflective-polish/--no-reflective-polish` 覆盖
+`pipeline.reflective_polish`；与 `--no-polish` 或 `three_draft_synthesis`
+同时开启会被拒绝。
 `translate` 没有 `--no-autofix`：可用 YAML 阻止自动 Review 启动新发布，
 或跳过自动 Review，随后使用带 `--no-autofix` 的独立命令。
 详见 [Review 与 Autofix](../guide/pipeline.md#review-and-autofix)。

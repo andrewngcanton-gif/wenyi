@@ -69,6 +69,7 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
         out: str | None = None,
         polish: bool | None = None,
         translation_mode: TranslationMode | None = None,
+        reflective_polish: bool | None = None,
         review: bool | None = None,
         mono: bool | None = None,
         bilingual: bool | None = None,
@@ -94,6 +95,7 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
                 out=out,
                 polish=polish,
                 translation_mode=translation_mode,
+                reflective_polish=reflective_polish,
                 review=review,
                 mono=mono,
                 bilingual=bilingual,
@@ -121,6 +123,7 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
         out: str | None = None,
         polish: bool | None = None,
         translation_mode: TranslationMode | None = None,
+        reflective_polish: bool | None = None,
         review: bool | None = None,
         mono: bool | None = None,
         bilingual: bool | None = None,
@@ -137,6 +140,8 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
             pipeline_values["polish"] = polish
         if translation_mode is not None:
             pipeline_values["translation_mode"] = translation_mode.value
+        if reflective_polish is not None:
+            pipeline_values["reflective_polish"] = reflective_polish
         try:
             config.pipeline = PipelineConfig.model_validate(pipeline_values)
         except ValueError:
@@ -146,6 +151,17 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
             ):
                 raise ValueError(
                     "three_draft_synthesis translation mode requires pipeline.polish=true; remove --no-polish"
+                ) from None
+            if pipeline_values.get("reflective_polish") and not pipeline_values["polish"]:
+                raise ValueError(
+                    "pipeline.reflective_polish requires pipeline.polish=true; remove --no-polish"
+                ) from None
+            if (
+                pipeline_values.get("reflective_polish")
+                and pipeline_values["translation_mode"] == "three_draft_synthesis"
+            ):
+                raise ValueError(
+                    "pipeline.reflective_polish is not supported with three_draft_synthesis; use --translation-mode standard"
                 ) from None
             raise
         if review is not None:
@@ -306,6 +322,11 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
             "--translation-mode",
             help="Book translation mode; three_draft_synthesis requires polishing",
         ),
+        reflective_polish: bool | None = typer.Option(
+            None,
+            "--reflective-polish/--no-reflective-polish",
+            help="Override pipeline.reflective_polish; critique each batch before polishing",
+        ),
         review: bool | None = typer.Option(
             None,
             "--review/--no-review",
@@ -336,6 +357,7 @@ def register_workflows_commands(app: typer.Typer, context: ContextAccessor) -> N
             out=out,
             polish=polish,
             translation_mode=translation_mode,
+            reflective_polish=reflective_polish,
             review=review,
             mono=mono,
             bilingual=bilingual,

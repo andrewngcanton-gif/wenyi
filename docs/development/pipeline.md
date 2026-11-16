@@ -86,6 +86,24 @@ retranslation. A fully checkpointed batch skips both. Chapter completion follows
 its required batch and chapter-level work. Keep interruption tests at the boundaries
 between target persistence, alignment and glossary checkpointing.
 
+Reflective polishing adds no stage checkpoint. It runs inside the same batch:
+translation, an optional critique, then a validated revision, ordinary polishing or
+the standalone polish fallback. `save_chapter` still publishes the batch atomically,
+so an interruption before that save reruns the whole batch and may repeat paid
+requests. A critique that is missing, partial or malformed is never converted into a
+clean or keep outcome; it falls back and is recorded as invalid.
+
+Reflection diagnostics are written after the existing save and alignment, under
+`reflection/chapter-<n>/batch-<start>-<count>.json`. They carry hashes and lengths of
+the batch source and formal targets, bounded issue evidence, logical attempt counts,
+configured route identities and observed request identities. They may contain private
+source and translated fragments and are protected like other run artifacts. Only the
+single diagnostic write tolerates ordinary I/O failure: the saved chapter stays, the
+run continues, and the batch event records `artifact_status=write_failed`. Stop
+exceptions propagate, and a failed formal save writes no record. These records are
+diagnostic only: `current`, `stale` and `missing` never drive skipping, resume or
+export, and a missing record is never treated as a clean critique.
+
 `wenyi_core.alignment` owns the format-independent text-location contract, not DOM,
 storage or provider behavior. `AlignmentUnit` requests points/ranges in immutable
 source/target text; `TextAligner` returns digest-bound `aligned` or `unresolved`
@@ -210,8 +228,8 @@ database to bypass the injected adapter.
 
 Artifact keys are run-relative, `/`-separated names on every backend. Limit prefix
 queries to the relevant subtree rather than scanning unrelated source caches.
-Precision archives, policy plans and Review traces are artifacts, not portable
-absolute filesystem paths. `Storage` path-shaped identity properties do not grant
+Precision archives, policy plans, Review traces and reflection diagnostics are
+artifacts, not portable absolute filesystem paths. `Storage` path-shaped identity properties do not grant
 domain services permission to write around the port.
 
 Preserve the lock roles:

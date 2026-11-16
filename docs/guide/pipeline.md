@@ -30,6 +30,7 @@ The default export is monolingual; a bilingual edition is optional.
 | --- | --- | --- |
 | Whole-book understanding | Chapter facts and an overview before the first body batch | Reads all chapter source text; long chapters need multiple prescan calls |
 | Polishing | A second pass for target-language expression | Adds a model call to a normal standard batch; fluency is not proof of fidelity |
+| Reflective polishing | A structured critique before polishing, then a gated revision | Adds a critique call, and a revision or ordinary polish call; an invalid critique falls back rather than saving a call |
 | Three-draft precision | Three independent attempts followed by source-aware synthesis | Normally four body-stage calls instead of two with standard translation and polishing |
 | Annotation/style alignment | Places links and mixed formatting in translated text | Partial spans can require additional model calls; uncertain placements use format-specific fallbacks |
 | Review and Autofix | Whole-book consistency checks, evidence gathering and revisions | Can make several passes and additional Fixer calls; publishing changes the saved translation |
@@ -40,6 +41,34 @@ ratio. Retries, output length, reasoning tokens, and provider prices matter. Pro
 prefix reuse may help provider caching but does not guarantee a cache hit.
 None of these options guarantees a more accurate translation; compare representative
 passages and review important results yourself.
+
+<a id="reflective-polish"></a>
+
+### Reflective polishing
+
+`pipeline.reflective_polish` is opt-in and applies only to standard translation
+with polishing enabled. Instead of polishing immediately, the batch continues the
+translation conversation with a structured critique of style, fluency, idiom and
+accuracy. Only issues that pass strict validation and reach
+`reflect_min_severity` are sent back with a revision request. Filtered or
+untranslated paragraphs keep their draft, and the revision must preserve the
+paragraph count, protected objects and ruby markers.
+
+- **Clean result:** a complete, valid critique with no issue at or above the
+  threshold. `reflect_clean_batches: polish` then runs ordinary polishing;
+  `keep` saves the draft and skips that call.
+- **Fallback:** a missing, partial, malformed or failed critique never counts as
+  clean. The batch uses ordinary polishing, and if that also fails, the standalone
+  polish path. `keep` is never applied to an unvalidated critique.
+- **Cost:** a normal enabling batch makes translation → critique → revision, or
+  translation → critique → polish when clean. Structural retries and fallback calls
+  are billed too. Nothing here guarantees a better translation; compare
+  representative passages yourself.
+
+Every enabled batch also writes a diagnostic record under `reflection/` for later
+inspection. It is not a checkpoint: standard batches remain atomic, interrupted work
+is redone as a whole, and a missing or stale record is never treated as a clean
+batch.
 
 <a id="preparation"></a>
 

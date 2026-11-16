@@ -163,3 +163,63 @@ def test_domain_services_have_no_direct_state_files_or_sqlite():
             assert not any(
                 module.split(".")[0] in {"wenyi_cli", "typer", "rich"} for module in modules
             ), path
+
+
+@pytest.mark.parametrize("storage_type", [FileStorage, SqliteStorage])
+def test_reflection_artifact_roundtrips_in_bundled_backends(tmp_path, storage_type):
+    import json
+    import re
+
+    from wenyi_core.llm.providers.fake import FakeClient
+    from wenyi_core.pipeline.translate.reflection_records import reflection_artifact_status
+
+    source = tmp_path / "book.txt"
+    source.write_text("First chapter\n\nA short story.\n", encoding="utf-8")
+    config = Config.from_dict(
+        {
+            "language": {"source": "en", "target": "zh"},
+            "llm": {"preset": "fake"},
+            "pipeline": {
+                "book_understanding": False,
+                "review": False,
+                "review_autofix": False,
+                "annotation_alignment": False,
+                "reflective_polish": True,
+            },
+        }
+    )
+
+    def handler(messages, tier, json_mode):
+        if "[Reflect]" in messages[-1]["content"]:
+            first_user = next(m["content"] for m in messages if m["role"] == "user")
+            n = len(re.findall(r"^\[\d+\]", first_user, re.MULTILINE))
+            return json.dumps({"issues": [], "reviewed_segments": n, "complete": True})
+        return routing_handler(messages, tier, json_mode)
+
+    store = storage_type(str(tmp_path / "state"))
+    try:
+        Orchestrator(config, client=FakeClient(handler=handler), storage=store).run_all(
+            str(source), out_format="txt", out_path=str(tmp_path / "out.txt")
+        )
+        keys = store.list_artifacts("reflection/")
+        assert len(keys) == 1
+        record = store.read_artifact(keys[0])
+        assert record["schema"] == 1
+        assert record["critique"] == "validated_clean"
+        assert record["targets"]["stage"] == "post_alignment"
+        chapter = store.load_chapter(0)
+        expected = {
+            "chapter": 0,
+            "start_index": 0,
+            "source_sha256": store.load_manifest()["source_sha256"],
+            "source_language": "en",
+            "target_language": "zh",
+            "batch_source_sha256": record["batch_source_sha256"],
+            "segment_indices": [segment.index for segment in chapter.text_segments],
+            "policy": record["policy"],
+        }
+        status = reflection_artifact_status(record, expected, chapter.text_segments)
+        assert status == {"status": "current", "reason": None}
+        assert Path(tmp_path / "out.txt").is_file()
+    finally:
+        store.close()
