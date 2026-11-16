@@ -1,0 +1,28 @@
+# Optional group E reference template for three-draft synthesis. It is not
+# implemented in WP1a; requesting group E fails explicitly.
+language:
+  source: en
+  target: zh
+llm:
+  preset: fake
+pipeline:
+  review: true
+  polish: true
+  translation_mode: three_draft_synthesis
+  book_understanding: true
+  review_autofix: false
+  prescan_concurrency: 1
+  annotation_alignment_concurrency: 1
+  review_concurrency: 1
+  review_output_retries: 0
+  review_agent_max_evidence_rounds: 0
+  review_fix_max_rounds: 0
+segment:
+  max_tokens_per_batch: 1800
+  max_tokens_per_segment: 1200
+output:
+  mono: true
+  bilingual: false
+  about_page: false
+paths:
+  state_dir: "/replace/with/absolute/disposable/eval/state/E"

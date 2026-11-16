@@ -1,0 +1,32 @@
+# Example configuration for an English -> Chinese evaluation.
+#
+# This file is an example only. It does not bundle, download, or point at any
+# corpus, and no evaluation has been executed with it. Supply a license-clear
+# fixture, provider credentials, and an absolute disposable state directory before use.
+language:
+  source: en
+  target: zh
+llm:
+  # Replace with the provider you are licensed to use. Credentials are read
+  # from the provider's environment variable (for example DEEPSEEK_API_KEY).
+  preset: deepseek
+pipeline:
+  review: true
+  polish: true
+  book_understanding: true
+  review_autofix: false
+  prescan_concurrency: 1
+  annotation_alignment_concurrency: 1
+  review_concurrency: 1
+  review_output_retries: 0
+  review_agent_max_evidence_rounds: 0
+  review_fix_max_rounds: 0
+segment:
+  max_tokens_per_batch: 1800
+  max_tokens_per_segment: 1200
+output:
+  mono: true
+  bilingual: false
+  about_page: false
+paths:
+  state_dir: "/replace/with/absolute/disposable/eval/state/en-zh"
